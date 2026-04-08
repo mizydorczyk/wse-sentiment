@@ -1,0 +1,6 @@
+.DS_Store
+
+renv/library/
+!renv.lock
+
+dataset/
