@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# The commit message file is passed as the first argument
+COMMIT_MESSAGE_FILE=$1
+COMMIT_MESSAGE_FILE=$(cat "$COMMIT_MESSAGE_FILE")
+
+# Regex for feat, chore, fix, docs (with optional scope)
+REGEX="^(feat|chore|fix|docs)(\([^)]+\))?:[[:space:]]"
+
+if ! echo "$COMMIT_MESSAGE_FILE" | grep -Eq "$REGEX"; then
+  echo "Invalid commit message format."
+  echo "Message was: '$COMMIT_MESSAGE_FILE'"
+  echo "Must start with feat:, chore:, fix:, or docs:"
+  echo "Example: 'feat: add RSS parser' or 'fix: remove NAs'"
+  exit 1
+fi
