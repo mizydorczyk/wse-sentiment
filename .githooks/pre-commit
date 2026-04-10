@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# Find if there are any R files staged for commit in the src/ directory
+if ! git diff --cached --name-only | grep -q "^src/.*\.R$"; then
+  # If no R files are staged in src/, we can skip the heavy R process
+  exit 0
+fi
+
+echo "Running styler on src/..."
+Rscript -e "suppressMessages(styler::style_dir('src'))"
+
+# Check if styler made changes to the files that are not staged
+# (meaning styler modified them just now)
+if ! git diff --quiet src/; then
+  echo "Styler modified some files to fix formatting!"
+  echo "Please review the changes, run 'git add', and try committing again."
+  exit 1
+fi
+
+echo "Running lintr on src/..."
+Rscript -e "
+lints <- lintr::lint_dir('src')
+if (length(lints) > 0) {
+  print(lints)
+  quit(status = 1)
+}
+"
+
+if [ $? -ne 0 ]; then
+  echo "Commit aborted because lintr found issues. Please fix them."
+  exit 1
+fi
+
+echo "Code style and linting checks passed!"
+exit 0
