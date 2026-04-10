@@ -6,8 +6,6 @@ It relies on historical data previously collected and stored in the `dataset/` d
 
 The system architecture is designed in a modular way so that a live mode (which would continuously monitor the feed in real-time for immediate signal generation) can be easily implemented in the future once the backtesting proves successful.
 
----
-
 ## Structure
 
 ```text
