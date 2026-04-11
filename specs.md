@@ -14,12 +14,13 @@ wse-sentiment/
 │   ├── raw/
 │   └── processed/
 ├── src/
-│   ├── 01_collect_rss.R
-│   ├── 02_scrape_articles.R
-│   ├── 03_assign_tickers.R
-│   ├── 04_sentiment.R
-│   ├── 05_clustering.R
-│   └── 06_correlation_gpw.R
+│   ├── collect_rss.R
+│   ├── scrape_articles.R
+│   ├── parse_article.R
+│   ├── assign_tickers.R
+│   ├── sentiment.R
+│   ├── clustering.R
+│   └── correlation_gpw.R
 ├── report/
 │   └── raport.Rmd
 ├── README.md
