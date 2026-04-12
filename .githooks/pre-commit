@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
 
 # Find if there are any R files staged for commit in the src/ directory
-if ! git diff --cached --name-only | grep -q "^src/.*\.R$"; then
+staged_r_files=$(git diff --cached --name-only --diff-filter=ACMR | grep "^src/.*\.R$" || true)
+
+if [ -z "$staged_r_files" ]; then
   # If no R files are staged in src/, we can skip the heavy R process
   exit 0
 fi
 
-echo "Running styler on src/..."
-Rscript -e "suppressMessages(styler::style_dir('src'))"
+echo "Running styler on staged src R files..."
+Rscript -e "suppressMessages(styler::style_file(strsplit(Sys.getenv('STAGED_R_FILES'), '\n', fixed = TRUE)[[1]]))" \
+  STAGED_R_FILES="$staged_r_files"
 
-# Check if styler made changes to the files that are not staged
-# (meaning styler modified them just now)
-if ! git diff --quiet src/; then
-  echo "Styler modified some files to fix formatting!"
+# Check if styler made changes to the staged files
+if ! git diff --quiet -- $staged_r_files; then
+  echo "Styler modified some staged files to fix formatting!"
   echo "Please review the changes, run 'git add', and try committing again."
   exit 1
 fi
 
-echo "Running lintr on src/..."
+echo "Running lintr on staged src R files..."
 Rscript -e "
-lints <- lintr::lint_dir('src')
+files <- strsplit(Sys.getenv('STAGED_R_FILES'), '\n', fixed = TRUE)[[1]]
+files <- files[nzchar(files)]
+lints <- lintr::lint_package(path = '.', files = files)
 if (length(lints) > 0) {
   print(lints)
   quit(status = 1)
 }
-"
+" \
+  STAGED_R_FILES="$staged_r_files"
 
 if [ $? -ne 0 ]; then
   echo "Commit aborted because lintr found issues. Please fix them."
