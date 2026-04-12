@@ -15,6 +15,7 @@ wse-sentiment/
 │   └── processed/
 ├── src/
 │   ├── collect_rss.R
+│   ├── collect_archive.R
 │   ├── scrape_articles.R
 │   ├── parse_article.R
 │   ├── assign_tickers.R

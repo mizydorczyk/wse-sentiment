@@ -182,12 +182,18 @@ for (i in seq_len(nrow(feed_df))) {
   writeLines(json_output, output_file)
   cat("  Saved to:", output_file, "\n")
 
+  scraped_at <- if (!is.null(scrape_result$metadata$scraped_at)) {
+    scrape_result$metadata$scraped_at
+  } else {
+    scrape_result$scraped_at
+  }
+
   manifest_entry <- list(
     id = article_id,
     file = file.path(basename(articles_dir), basename(output_file)),
     url = article_url,
     success = is.null(scrape_result$error),
-    scraped_at = scrape_result$metadata$scraped_at %||% scrape_result$scraped_at
+    scraped_at = scraped_at
   )
 
   if (manifest_entry$success) {
