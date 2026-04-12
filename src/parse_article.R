@@ -1,10 +1,12 @@
 #!/usr/bin/env Rscript
 
-library(rvest)
-library(dplyr)
-library(purrr)
-library(stringr)
-library(xml2)
+suppressPackageStartupMessages({
+  library(rvest)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(xml2)
+})
 
 parse_article <- function(article) {
   xml2::xml_remove(xml_find_all(article, "//style | //script"))

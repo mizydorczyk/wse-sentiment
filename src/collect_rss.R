@@ -7,6 +7,8 @@ suppressPackageStartupMessages({
   library(lubridate)
 })
 
+source("src/common/constants.R")
+
 feeds <- tibble::tibble(
   source_feed = c("finanse", "firma", "gielda", "waluty", "espi"),
   source_url = c(
@@ -18,8 +20,8 @@ feeds <- tibble::tibble(
   )
 )
 
-output_directory <- file.path("dataset", "raw")
-output_path <- file.path(output_directory, "feed.csv")
+output_directory <- constants$raw_directory
+output_path <- constants$rss_feeds_path
 
 parse_html <- function(x) {
   x <- trimws(as.character(x))
@@ -62,7 +64,7 @@ parse_publication_date <- function(date_string) {
       locale = "C"
     ),
     error = function(e) {
-      message("WARNING: Failed to parse date: ", date_string)
+      message("Failed to parse date: ", date_string)
       NA
     }
   )
