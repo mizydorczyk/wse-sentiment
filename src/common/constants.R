@@ -1,7 +1,8 @@
 constants <- list(
   raw_directory = file.path("dataset", "raw"),
-  rss_feed_path = file.path("dataset", "raw", "rss.csv"),
-  archive_feed_path = file.path("dataset", "raw", "archive.csv"),
+  rss_feeds_path = file.path("dataset", "raw", "rss.csv"),
+  archive_feeds_path = file.path("dataset", "raw", "archive.csv"),
+  combined_feeds_path = file.path("dataset", "raw", "feeds.csv"),
   articles_directory = file.path("dataset", "raw", "articles"),
   articles_manifest_path = file.path("dataset", "raw", "articles_manifest.json"),
   user_agents = c(

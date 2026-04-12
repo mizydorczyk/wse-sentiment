@@ -46,7 +46,7 @@ archive_sections <- tibble::tibble(
 source("src/common/constants.R")
 
 output_directory <- constants$raw_directory
-output_path <- constants$archive_feed_path
+output_path <- constants$archive_feeds_path
 
 user_agents <- constants$user_agents
 referers <- constants$referers

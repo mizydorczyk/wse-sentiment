@@ -13,7 +13,7 @@ parse_article <- NULL
 source("src/parse_article.R")
 source("src/common/constants.R")
 
-input_file <- constants$rss_feed_path
+input_file <- constants$combined_feeds_path
 articles_dir <- constants$articles_directory
 manifest_file <- constants$articles_manifest_path
 

@@ -21,7 +21,7 @@ feeds <- tibble::tibble(
 )
 
 output_directory <- constants$raw_directory
-output_path <- constants$rss_feed_path
+output_path <- constants$rss_feeds_path
 
 parse_html <- function(x) {
   x <- trimws(as.character(x))

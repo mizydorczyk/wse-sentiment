@@ -16,6 +16,7 @@ wse-sentiment/
 ├── src/
 │   ├── collect_rss.R
 │   ├── collect_archive.R
+│   ├── deduplicate_feeds.R
 │   ├── scrape_articles.R
 │   ├── parse_article.R
 │   ├── assign_tickers.R
@@ -32,6 +33,12 @@ wse-sentiment/
 
 ### Collect RSS
 The first step of the pipeline focuses on gathering data from the `bankier.pl` RSS feed—the sole data source for this project. For the current backtesting approach, this involves compiling a historical archive of headlines, publication times, and links to the full articles. This historical dataset serves as the foundation for all subsequent analysis.
+
+### Collect archives
+This module extends the historical coverage by crawling Bankier article archive pages and collecting older listings that are not present in the live RSS feed. It captures article metadata such as titles, publication times, links, and collected timestamps so the backtest dataset can cover a broader time range.
+
+### Merge, deduplicate, and normalize
+After RSS and archive data are collected, this module normalizes article URLs, deduplicates overlapping entries, and merges both sources into a single canonical feed file. It preserves source provenance while preferring RSS content when the same article appears in both inputs.
 
 ### Scrape articles
 Because RSS feeds usually only provide a short summary or headline, this module visits the original source links to extract the full text of the articles. Having the complete article body is crucial for understanding the full context and nuances required for accurate sentiment analysis.
