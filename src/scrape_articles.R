@@ -1,18 +1,24 @@
 #!/usr/bin/env Rscript
 
-library(dplyr)
-library(readr)
-library(purrr)
-library(rvest)
-library(stringr)
-library(jsonlite)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(purrr)
+  library(rvest)
+  library(stringr)
+  library(jsonlite)
+})
 
 parse_article <- NULL
 source("src/parse_article.R")
+source("src/common/constants.R")
 
-input_file <- "dataset/raw/feed.csv"
-articles_dir <- "dataset/raw/articles"
-manifest_file <- "dataset/raw/articles_manifest.json"
+input_file <- constants$rss_feed_path
+articles_dir <- constants$articles_directory
+manifest_file <- constants$articles_manifest_path
+
+user_agents <- constants$user_agents
+referers <- constants$referers
 
 if (!dir.exists(articles_dir)) {
   dir.create(articles_dir, recursive = TRUE)
@@ -34,22 +40,6 @@ if (!"id" %in% colnames(feed_df)) {
   feed_df <- feed_df |>
     mutate(id = row_number())
 }
-
-user_agents <- c(
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-  "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
-)
-
-referers <- c(
-  "https://www.google.com/",
-  "https://www.bing.com/",
-  "https://www.bankier.pl/",
-  "https://www.bankier.pl/rynek",
-  "https://www.bankier.pl/wiadomosci"
-)
 
 add_random_delay <- function(min_seconds, max_seconds) {
   delay_seconds <- runif(1, min = min_seconds, max = max_seconds)
