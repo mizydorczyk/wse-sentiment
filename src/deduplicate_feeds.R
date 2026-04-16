@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 
 suppressPackageStartupMessages({
+  library(digest)
   library(dplyr)
   library(lubridate)
   library(readr)
@@ -124,7 +125,7 @@ if (nrow(combined) == 0) {
   dir.create(constants$raw_directory, recursive = TRUE, showWarnings = FALSE)
   write_csv(
     tibble(
-      id = integer(),
+      id = character(),
       title = character(),
       link = character(),
       publication_date = character(),
@@ -156,7 +157,7 @@ deduped <- combined |>
     .groups = "drop"
   ) |>
   arrange(.data$publication_date, .data$link) |>
-  mutate(id = row_number()) |>
+  mutate(id = vapply(.data$link, function(x) digest::digest(x, algo = "md5", serialize = FALSE), character(1))) |>
   select(
     id,
     title,
