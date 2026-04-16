@@ -157,7 +157,7 @@ if (file.exists(manifest_file)) {
   cat("Loading existing manifest to resume progress...\n")
   existing_manifest <- fromJSON(manifest_file, simplifyVector = FALSE)
   for (entry in existing_manifest) {
-    manifest[[as.character(entry$id)]] <- entry
+    manifest[[as.character(entry$url)]] <- entry
   }
 }
 
@@ -168,8 +168,8 @@ for (i in seq_len(nrow(feed_df))) {
   article_url <- feed_df$link[i]
   output_file <- file.path(articles_dir, paste0(article_id, ".json"))
 
-  if (!is.null(manifest[[article_id]]) && isTRUE(manifest[[article_id]]$success) && file.exists(output_file)) {
-    cat("  Skipping already processed article:", article_id, "\n")
+  if (!is.null(manifest[[article_url]]) && isTRUE(manifest[[article_url]]$success)) {
+    cat("  Skipping already processed article:", article_url, "\n")
     next
   }
 
@@ -203,7 +203,7 @@ for (i in seq_len(nrow(feed_df))) {
     manifest_entry$error <- scrape_result$error
   }
 
-  manifest[[article_id]] <- manifest_entry
+  manifest[[article_url]] <- manifest_entry
 
   manifest_json <- toJSON(unname(manifest), pretty = TRUE, auto_unbox = TRUE)
   writeLines(manifest_json, manifest_file)
