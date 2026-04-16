@@ -97,10 +97,8 @@ scrape_and_parse_article <- function(article_url, feed_row) {
           title = ifelse(is.na(parsed_article$title), "", parsed_article$title),
           article_label = ifelse(is.na(parsed_article$label), "", parsed_article$label),
           author = ifelse(is.na(parsed_article$author), "", parsed_article$author),
-          publication_date = ifelse(is.na(parsed_article$pub_date), "", parsed_article$pub_date),
-          scraped_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ"),
-          feed_source = ifelse(is.null(feed_row$source_feed), "", feed_row$source_feed),
-          feed_url = ifelse(is.null(feed_row$source_url), "", feed_row$source_url)
+          publication_date = ifelse(is.na(parsed_article$publication_date), "", parsed_article$publication_date),
+          scraped_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ")
         ),
         content = list(
           lead = ifelse(is.na(parsed_article$lead), "", parsed_article$lead),
