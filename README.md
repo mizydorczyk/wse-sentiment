@@ -20,3 +20,26 @@ Run the following command in your R console to download and install the exact pa
     ```R
     renv::restore()
     ```
+
+## How to run?
+
+### With Docker
+
+Build the image and run the scripts:
+
+```bash
+docker build -t wse-sentiment .
+docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/collect_rss.R
+docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/deduplicate_feeds.R
+docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/scrape_articles.R
+```
+
+### Without Docker
+
+Run the scripts directly from your terminal:
+
+```bash
+Rscript src/collect_rss.R
+Rscript src/deduplicate_feeds.R
+Rscript src/scrape_articles.R
+```
