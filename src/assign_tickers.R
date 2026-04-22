@@ -12,7 +12,7 @@ source("src/company_dictionary.R")
 source("src/common/constants.R")
 
 raw_articles_dir <- constants$articles_directory
-processed_manifest_file <- file.path("dataset", "processed", "articles_manifest.json")
+processed_manifest_file <- constants$processed_manifest_file
 
 if (!dir.exists(dirname(processed_manifest_file))) {
   dir.create(dirname(processed_manifest_file), recursive = TRUE)
