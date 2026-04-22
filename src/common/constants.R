@@ -5,6 +5,7 @@ constants <- list(
   combined_feeds_path = file.path("dataset", "raw", "feeds.csv"),
   articles_directory = file.path("dataset", "raw", "articles"),
   articles_manifest_path = file.path("dataset", "raw", "articles_manifest.json"),
+  processed_manifest_file = file.path("dataset", "processed", "articles_manifest.json"),
   user_agents = c(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0",

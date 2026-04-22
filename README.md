@@ -32,6 +32,7 @@ docker build -t wse-sentiment .
 docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/collect_rss.R
 docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/deduplicate_feeds.R
 docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/scrape_articles.R
+docker run --rm -v $(pwd)/dataset:/app/dataset wse-sentiment Rscript src/assign_tickers.R
 ```
 
 ### Without Docker
@@ -42,4 +43,11 @@ Run the scripts directly from your terminal:
 Rscript src/collect_rss.R
 Rscript src/deduplicate_feeds.R
 Rscript src/scrape_articles.R
+Rscript src/assign_tickers.R
+```
+
+## How to run tests?
+
+```bash
+Rscript -e 'testthat::test_dir("tests/testthat", reporter="progress", chdir = TRUE)'
 ```

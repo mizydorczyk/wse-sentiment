@@ -20,6 +20,7 @@ wse-sentiment/
 │   ├── scrape_articles.R
 │   ├── parse_article.R
 │   ├── assign_tickers.R
+│   ├── company_dictionary.R
 │   ├── sentiment.R
 │   ├── clustering.R
 │   └── correlation_gpw.R
