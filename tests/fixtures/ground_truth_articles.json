@@ -1,0 +1,168 @@
+[
+  {
+    "id": "article_test_1",
+    "metadata": {
+      "title": "CD Projekt opóźnia premierę nowej gry"
+    },
+    "content": {
+      "lead": "Akcje spółki spadły na otwarciu o 5%.",
+      "paragraphs": [
+        "Inwestorzy obawiają się o przyszłość CDR.",
+        "Zarząd CD Projekt S.A. zapowiedział jednak nowe inwestycje."
+      ]
+    },
+    "expected_tickers": ["CDR"]
+  },
+  {
+    "id": "article_test_2",
+    "metadata": {
+      "title": "11 bit studios prezentuje rewelacyjne wyniki finansowe"
+    },
+    "content": {
+      "lead": "Twórcy Frostpunka pokazali rekordowe zyski za trzeci kwartał.",
+      "paragraphs": [
+        "Spółka 11 bit studios ogłosiła również plany dotyczące nowej kampanii marketingowej."
+      ]
+    },
+    "expected_tickers": ["11B"]
+  },
+  {
+    "id": "article_test_3",
+    "metadata": {
+      "title": "Wzrosty na warszawskim parkiecie"
+    },
+    "content": {
+      "lead": "WIG20 rośnie kolejny dzień z rzędu.",
+      "paragraphs": [
+        "Optymizm na giełdzie jest zauważalny we wszystkich sektorach gospodarki."
+      ]
+    },
+    "expected_tickers": []
+  },
+  {
+    "id": "article_test_4",
+    "metadata": {
+      "title": "Nowa strategia lidera branży budowlanej"
+    },
+    "content": {
+      "lead": "Budimex planuje ogłosić długoterminowe cele rozwoju na nadchodzące lata.",
+      "paragraphs": [
+        "Zarząd spółki Budimex poinformował o przygotowaniach do prezentacji nowej strategii.",
+        "Firma chce przyspieszyć tempo wzrostu, opierając się na silnym portfelu zamówień."
+      ]
+    },
+    "expected_tickers": ["BDX"]
+  },
+  {
+    "id": "article_test_5",
+    "metadata": {
+      "title": "Zmiany na rynku surowców"
+    },
+    "content": {
+      "lead": "Spadki cen ropy naftowej budzą niepokój inwestorów.",
+      "paragraphs": [
+        "Gospodarka światowa musi dostosować się do nowych realiów.",
+        "Decyzje polityczne mocarstw wpływają na wahania na giełdach towarowych."
+      ]
+    },
+    "expected_tickers": []
+  },
+  {
+    "id": "article_test_6",
+    "metadata": {
+      "title": "Rekordowa sprzedaż obuwia i odzieży"
+    },
+    "content": {
+      "lead": "Grupa CCC notuje gigantyczne zyski w e-commerce.",
+      "paragraphs": [
+        "Zarząd CCC podkreśla znaczenie sprzedaży internetowej w strategii firmy.",
+        "Analitycy przewidują dalsze wzrosty dla tej spółki na giełdzie."
+      ]
+    },
+    "expected_tickers": ["CCC"]
+  },
+  {
+    "id": "article_test_7",
+    "metadata": {
+      "title": "Ceny miedzi napędzają zyski polskiego giganta"
+    },
+    "content": {
+      "lead": "KGHM Polska Miedź prezentuje znakomite wyniki za ostatni kwartał.",
+      "paragraphs": [
+        "Wysokie ceny surowców na rynkach globalnych sprzyjają spółce KGHM.",
+        "Zarząd planuje wypłatę rekordowej dywidendy w tym roku."
+      ]
+    },
+    "expected_tickers": ["KGH"]
+  },
+  {
+    "id": "article_test_8",
+    "metadata": {
+      "title": "Fuzja na rynku paliwowym sfinalizowana"
+    },
+    "content": {
+      "lead": "PKN Orlen umacnia swoją pozycję w regionie.",
+      "paragraphs": [
+        "Prezes Orlenu ogłosił sukces długotrwałych negocjacji i przejęć.",
+        "Inwestorzy z entuzjazmem przyjęli wieści o ekspansji PKN Orlen."
+      ]
+    },
+    "expected_tickers": ["PKN"]
+  },
+  {
+    "id": "article_test_9",
+    "metadata": {
+      "title": "Wyniki banków zaskakują analityków"
+    },
+    "content": {
+      "lead": "PKO Bank Polski i mBank pokazują siłę sektora finansowego.",
+      "paragraphs": [
+        "Mimo trudnego otoczenia makroekonomicznego, PKO BP zanotował znaczący wzrost marży odsetkowej.",
+        "Z kolei mBank pochwalił się rosnącą liczbą nowych klientów korporacyjnych."
+      ]
+    },
+    "expected_tickers": ["PKO", "MBK"]
+  },
+  {
+    "id": "article_test_10",
+    "metadata": {
+      "title": "Zima w miastach i ptaki"
+    },
+    "content": {
+      "lead": "Czarny kruk siedział na zaśnieżonej gałęzi, obserwując przechodniów.",
+      "paragraphs": [
+        "Zima to trudny czas dla miejskiej fauny.",
+        "Ornitolodzy przypominają o mądrym dokarmianiu ptaków."
+      ]
+    },
+    "expected_tickers": []
+  },
+  {
+    "id": "article_test_11",
+    "metadata": {
+      "title": "Przegląd nowości w technologiach"
+    },
+    "content": {
+      "lead": "Branża gier i oprogramowania rozwija się w najlepsze.",
+      "paragraphs": [
+        "Wielu deweloperów planuje premiery na ten rok, w tym mniejsze niezależne studia.",
+        "Warto wspomnieć, że CD Projekt udostępnił wczoraj niewielką łatkę do swojej starszej gry, ale to nie jest główne wydarzenie miesiąca."
+      ]
+    },
+    "expected_tickers": []
+  },
+  {
+    "id": "article_test_12",
+    "metadata": {
+      "title": "Kolor orange to hit, który zdominował wybiegi"
+    },
+    "content": {
+      "lead": "Wiosenne trendy w modzie stawiają na odważne barwy.",
+      "paragraphs": [
+        "Odcień orange króluje w kolekcjach największych projektantów.",
+        "Warto dodać chociaż jeden akcent w tym kolorze do swojej garderoby."
+      ]
+    },
+    "expected_tickers": []
+  }
+]
