@@ -52,6 +52,26 @@ parse_article <- function(article) {
     str_squish() |>
     keep(~ nchar(.x) > 20)
 
+  if (length(paragraphs) == 0) {
+    emitent <- html_element(article, "section.o-article-content #emitent")
+    if (!is.na(emitent)) {
+      xml_remove(html_elements(emitent, "style"))
+
+      xml_add_sibling(xml_find_all(emitent, ".//br"), "text", "\n")
+      xml_add_sibling(xml_find_all(emitent, ".//p"), "text", "\n")
+
+      espi_content <- html_text(emitent) |>
+        str_split("\n") |>
+        unlist() |>
+        str_squish() |>
+        keep(~ nchar(.x) > 0)
+
+      if (length(espi_content) > 0) {
+        paragraphs <- espi_content
+      }
+    }
+  }
+
   headings <- article |>
     html_elements("section.o-article-content > h2") |>
     html_text2() |>
