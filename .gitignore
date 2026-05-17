@@ -4,4 +4,4 @@ renv/library/
 !renv.lock
 
 dataset/*
-!dataset/.gitkeep
+!dataset/raw
