@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libxml2-dev \
     libuv1-dev \
+    libx11-dev \
+    cmake \
     curl \
     build-essential \
     git \

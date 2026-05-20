@@ -1,2 +1,4 @@
 * text=auto
 .githooks/* text eol=lf
+
+dataset/raw/** filter=git-crypt diff=git-crypt
