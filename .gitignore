@@ -4,6 +4,7 @@ renv/library/
 !renv.lock
 
 dataset/*
+!dataset/raw
 !dataset/.gitkeep
 !dataset/dictionaries/
 dataset/dictionaries/_*/
