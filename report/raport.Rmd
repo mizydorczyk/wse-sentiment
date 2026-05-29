@@ -189,6 +189,65 @@ safe_chunk({
 
 # Analiza sentymentu
 
+## Chmury słów: pozytywne vs negatywne
+
+Słowa które najczęściej dostały etykietę `positive` (zielone) vs `negative` (czerwone) w korpusie. Wizualizacja kontrastu finansowego sentymentu.
+
+```{r wordcloud-sentiment, out.width="95%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "wordcloud_sentiment.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury wordcloud_sentiment.png.\n")
+})
+```
+
+## Chmury słów per kategoria LM
+
+Loughran-McDonald-style kategorie: `positive`, `negative`, `uncertainty` (niepewność), `litigious` (prawne), `constraining` (regulacyjne). Pokazuje semantyczny krajobraz każdej kategorii w korpusie bankier.pl.
+
+```{r wordcloud-per-category, fig.width=12, fig.height=8}
+safe_chunk({
+  suppressPackageStartupMessages({
+    library(wordcloud); library(RColorBrewer)
+  })
+  source("src/common/text_pipeline.R")
+  tokens <- if (file.exists(constants$lemmatized_tokens_cache)) {
+    readRDS(constants$lemmatized_tokens_cache)
+  } else NULL
+  lex <- tryCatch(load_sentiment_lexicon(), error = function(e) NULL)
+  if (is.null(tokens) || is.null(lex)) {
+    cat("Brak danych - uruchom pipeline.\n")
+  } else {
+    matched <- tokens |>
+      inner_join(lex |> filter(.data$pos != "ANY"), by = c("lemma", "pos"))
+    cats <- c("positive", "negative", "uncertainty", "litigious", "constraining")
+    palettes <- c(positive = "Greens", negative = "Reds",
+                  uncertainty = "BuPu", litigious = "Oranges", constraining = "Purples")
+
+    par(mfrow = c(2, 3), mar = c(1, 1, 2, 1))
+    for (cat_name in cats) {
+      sub <- matched |>
+        filter(.data$category == cat_name) |>
+        count(.data$lemma, sort = TRUE, name = "freq") |>
+        head(60)
+      if (nrow(sub) == 0) {
+        plot.new(); title(paste(cat_name, "(brak)"))
+        next
+      }
+      tryCatch({
+        wordcloud(sub$lemma, sub$freq, min.freq = 1, max.words = 60,
+                  scale = c(2.8, 0.4), random.order = FALSE, rot.per = 0.2,
+                  colors = brewer.pal(8, palettes[[cat_name]])[4:8])
+        title(cat_name, line = 0.5)
+      }, error = function(e) {
+        plot.new(); title(paste(cat_name, "(err)"))
+      })
+    }
+    plot.new()  # 6th cell empty
+  }
+})
+```
+
 ## Ranking spółek (per ticker)
 
 Wartość `mean_score` to średnia z znormalizowanych wyników sentymentu artykułów przypisanych do danej spółki. Tickery z `n_articles_with_signal = 0` (brak słów sentymentowych w artykułach) zostały odfiltrowane z wykresu rankingu i pokazane osobno.
@@ -711,6 +770,21 @@ safe_chunk({
 })
 ```
 
+## Chmury słów per klaster
+
+```{r kmeans-wordclouds, fig.width=12, fig.height=8}
+safe_chunk({
+  paths <- sprintf(file.path(constants$figures_directory, "wordcloud_cluster_%d.png"),
+                   seq_len(constants$sentiment_kmeans_k))
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    cat("Brak figur wordcloud_cluster_*.png.\n")
+  } else {
+    knitr::include_graphics(paths)
+  }
+})
+```
+
 # Topic modeling (LDA)
 
 ```{r topics-lda-k}
@@ -766,6 +840,21 @@ safe_chunk({
       slice_max(beta, n = 5) %>%
       summarise(top_words = paste(term, collapse = ", "), .groups = "drop")
     knitr::kable(top5, caption = "Top 5 słów per temat")
+  }
+})
+```
+
+## Chmury słów per temat LDA
+
+```{r lda-wordclouds, fig.width=12, fig.height=8}
+safe_chunk({
+  paths <- sprintf(file.path(constants$figures_directory, "wordcloud_topic_%d.png"),
+                   seq_len(constants$sentiment_lda_k))
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) {
+    cat("Brak figur wordcloud_topic_*.png.\n")
+  } else {
+    knitr::include_graphics(paths)
   }
 })
 ```

@@ -11,9 +11,6 @@ dataset/*
 dataset/dictionaries/_*/
 dataset/processed/*.rds
 
-CONTEXT.md
-PLAN.md
-
 # plWordNet raw dump (download poza repo)
 *.zip
 *.sql
