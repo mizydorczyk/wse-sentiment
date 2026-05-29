@@ -1,0 +1,488 @@
+---
+title: "Analiza sentymentu i tematów artykułów finansowych GPW"
+subtitle: "Projekt zaliczeniowy PSI 2026"
+author: "fzablocki"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    theme: readable
+    highlight: kate
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+    df_print: paged
+knit: (function(input, ...) rmarkdown::render(input, knit_root_dir = rprojroot::find_root(rprojroot::has_file("renv.lock")), output_dir = dirname(input)))
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(knitr)
+  library(DT)
+  library(scales)
+  library(jsonlite)
+})
+
+source("src/common/constants.R")
+
+safe_read_csv <- function(path, label) {
+  if (!file.exists(path)) {
+    message(sprintf("[Brak danych] %s: %s", label, path))
+    return(NULL)
+  }
+  read.csv(path, stringsAsFactors = FALSE, encoding = "UTF-8")
+}
+
+safe_read_json <- function(path, label) {
+  if (!file.exists(path)) {
+    message(sprintf("[Brak danych] %s: %s", label, path))
+    return(NULL)
+  }
+  jsonlite::fromJSON(path, simplifyDataFrame = TRUE)
+}
+
+safe_chunk <- function(expr, fallback_msg = "Dane jeszcze niedostępne — uruchom pipeline aby wygenerować.") {
+  tryCatch(expr, error = function(e) {
+    cat(fallback_msg, "\n")
+    cat("Błąd:", conditionMessage(e), "\n")
+  })
+}
+
+fmt_int <- function(x) scales::comma(x, accuracy = 1, big.mark = " ")
+fmt_pct <- function(x) scales::percent(x, accuracy = 0.1)
+```
+
+# Wprowadzenie
+
+Celem projektu jest zbudowanie pipeline'u automatycznej analizy tekstów finansowych z serwisu **bankier.pl**, który dla każdej spółki notowanej na **Giełdzie Papierów Wartościowych w Warszawie (GPW)** wyciąga sygnał sentymentu medialnego oraz identyfikuje główne tematy poruszane w artykułach. Praca powstała w ramach przedmiotu *Projektowanie Systemów Informatycznych* (PSI) na semestr 2026.
+
+Źródłem danych są artykuły scrapowane z bankier.pl — zarówno bieżące przez RSS, jak i historyczne przez archiwum portalu. Tickery spółek GPW przypisywane są automatycznie do każdego artykułu na podstawie wykrywania wystąpień nazw firm i symboli giełdowych w tekście (skrypt `src/data_ingestion/assign_tickers.R`).
+
+Zastosowano cztery techniki text miningu: (1) **leksykonową analizę sentymentu** opartą na zhybrydyzowanym słowniku polskim, (2) **modelowanie tematyczne LDA** (Latent Dirichlet Allocation), (3) **TF-IDF** profile semantyczne per spółka oraz (4) analizę **częstości słów** wraz z chmurą słów. Raport prezentuje wyniki — kod analizy znajduje się w `src/sentiment/sentiment.R` oraz `src/clustering/clustering.R`.
+
+# Dane i preprocessing
+
+Pipeline danych obejmuje następujące etapy: pobranie listy artykułów (RSS + archive) → scraping treści → parsowanie HTML do czystego tekstu → przypisanie tickerów GPW → lematyzacja tekstu modelem **udpipe** (`polish-pdb-ud-2.5`).
+
+**Słowniki sentymentu** stanowią hybrydę trzech źródeł:
+
+- **plWordNet emo** — ogólnotematyczny słownik emocji dla języka polskiego (~31 000 słów),
+- **Loughran-McDonald PL** — finansowy słownik LM przetłumaczony na polski (~4 150 słów),
+- **Custom PL** — własny minisłownik specyficzny dla domeny GPW (~30 słów).
+
+**Stopwords** to lista `stopwords-iso` dla języka polskiego rozszerzona o ~22 słowa domenowe (np. *spółka*, *akcja*, *rynek* — neutralne w kontekście).
+
+```{r dane-summary}
+safe_chunk({
+  manifest <- safe_read_json(constants$processed_manifest_file, "manifest artykułów")
+  if (is.null(manifest)) {
+    cat("Manifest artykułów jeszcze niedostępny.\n")
+  } else {
+    df <- if (is.data.frame(manifest)) manifest else as.data.frame(manifest)
+
+    n_articles <- nrow(df)
+    date_col <- intersect(c("date", "published", "pub_date", "published_at"), names(df))[1]
+    date_range <- if (!is.na(date_col) && !is.null(date_col)) {
+      d <- suppressWarnings(as.Date(df[[date_col]]))
+      sprintf("%s — %s", min(d, na.rm = TRUE), max(d, na.rm = TRUE))
+    } else "n/d"
+
+    ticker_col <- intersect(c("tickers", "ticker", "assigned_tickers"), names(df))[1]
+    n_tickers <- if (!is.na(ticker_col) && !is.null(ticker_col)) {
+      vals <- df[[ticker_col]]
+      if (is.list(vals)) length(unique(unlist(vals))) else length(unique(unlist(strsplit(as.character(vals), "[,;\\s]+"))))
+    } else NA_integer_
+
+    text_col <- intersect(c("text", "body", "content"), names(df))[1]
+    mean_len <- if (!is.na(text_col) && !is.null(text_col)) {
+      round(mean(nchar(df[[text_col]]), na.rm = TRUE))
+    } else NA_integer_
+
+    summary_tbl <- data.frame(
+      Metryka = c("Liczba artykułów", "Zakres dat", "Liczba unikalnych tickerów", "Średnia długość artykułu (znaki)"),
+      Wartość = c(fmt_int(n_articles), date_range,
+                  ifelse(is.na(n_tickers), "n/d", fmt_int(n_tickers)),
+                  ifelse(is.na(mean_len), "n/d", fmt_int(mean_len)))
+    )
+    knitr::kable(summary_tbl, caption = "Podsumowanie korpusu artykułów")
+  }
+})
+```
+
+# Analiza częstości słów
+
+## Top 30 najczęstszych słów
+
+```{r word-freq-top30}
+safe_chunk({
+  wf <- safe_read_csv(constants$word_freq, "word_freq")
+  if (is.null(wf)) {
+    cat("Brak danych word_freq.csv — uruchom pipeline tokenizacji.\n")
+  } else {
+    top30 <- wf %>%
+      arrange(desc(freq)) %>%
+      head(30) %>%
+      mutate(word = factor(word, levels = rev(word)))
+
+    ggplot(top30, aes(x = word, y = freq)) +
+      geom_col(fill = "steelblue") +
+      coord_flip() +
+      scale_y_continuous(labels = scales::comma) +
+      labs(
+        title = "Top 30 najczęstszych słów w korpusie",
+        x = NULL,
+        y = "Liczba wystąpień"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+## Wordcloud globalny
+
+```{r wordcloud-global, out.width="80%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "wordcloud_global.png")
+  if (!file.exists(path)) {
+    cat("Brak pliku", path, "— wygeneruj wordcloud w pipeline.\n")
+  } else {
+    knitr::include_graphics(path)
+  }
+})
+```
+
+# Analiza sentymentu
+
+## Ranking spółek (per ticker)
+
+Wartość `mean_score` to średnia z znormalizowanych wyników sentymentu artykułów przypisanych do danej spółki. Tickery z `n_articles_with_signal = 0` (brak słów sentymentowych w artykułach) zostały odfiltrowane z wykresu rankingu i pokazane osobno.
+
+```{r sentiment-per-ticker-bar}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  if (is.null(spt)) {
+    cat("Brak danych sentiment_per_ticker.csv.\n")
+  } else {
+    spt_signal <- spt %>%
+      filter(n_articles_with_signal > 0) %>%
+      arrange(desc(mean_score)) %>%
+      mutate(
+        ticker = factor(ticker, levels = ticker),
+        sign = ifelse(mean_score >= 0, "pozytywny", "negatywny")
+      )
+
+    ggplot(spt_signal, aes(x = ticker, y = mean_score, fill = sign)) +
+      geom_col() +
+      scale_fill_manual(values = c("pozytywny" = "#2ca02c", "negatywny" = "#d62728")) +
+      coord_flip() +
+      labs(
+        title = "Średni sentyment medialny per spółka GPW",
+        x = NULL,
+        y = "Średni score sentymentu",
+        fill = "Wydźwięk"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+```{r sentiment-per-ticker-top}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  if (is.null(spt)) {
+    cat("Brak danych.\n")
+  } else {
+    spt_signal <- spt %>% filter(n_articles_with_signal > 0)
+    top5_pos <- spt_signal %>% arrange(desc(mean_score)) %>% head(5)
+    top5_neg <- spt_signal %>% arrange(mean_score) %>% head(5)
+
+    cat("**Top 5 spółek o najpozytywniejszym sentymencie:**\n")
+    print(knitr::kable(top5_pos, digits = 3))
+    cat("\n**Top 5 spółek o najnegatywniejszym sentymencie:**\n")
+    print(knitr::kable(top5_neg, digits = 3))
+
+    no_signal <- spt %>% filter(n_articles_with_signal == 0)
+    if (nrow(no_signal) > 0) {
+      cat(sprintf("\n**Spółki bez sygnału sentymentu** (%d): %s\n",
+                  nrow(no_signal),
+                  paste(no_signal$ticker, collapse = ", ")))
+    }
+  }
+})
+```
+
+## Sentyment per artykuł
+
+Rozkład wyników sentymentu na poziomie pojedynczego artykułu — pozwala zobaczyć ogólny kształt korpusu (czy dominują nastroje pozytywne, neutralne czy negatywne).
+
+```{r sentiment-per-article-hist}
+safe_chunk({
+  spa <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  if (is.null(spa)) {
+    cat("Brak danych sentiment_per_article.csv.\n")
+  } else {
+    ggplot(spa, aes(x = score)) +
+      geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+      labs(
+        title = "Rozkład sentymentu per artykuł",
+        x = "Score sentymentu",
+        y = "Liczba artykułów"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+```{r sentiment-per-article-table}
+safe_chunk({
+  spa <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  if (is.null(spa)) {
+    cat("Brak danych.\n")
+  } else {
+    extremes <- bind_rows(
+      spa %>% arrange(desc(score)) %>% head(10) %>% mutate(kategoria = "Top 10 pozytywnych"),
+      spa %>% arrange(score) %>% head(10) %>% mutate(kategoria = "Top 10 negatywnych")
+    )
+    DT::datatable(
+      extremes,
+      filter = "top",
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    )
+  }
+})
+```
+
+## Sentyment GPW w czasie
+
+Linia trendu sentymentu medialnego w czasie — granularność tygodniowa (parametr `sentiment_timeline_granularity` w `constants.R`). Linia wygładzona (`geom_smooth`) pokazuje średnioterminowy trend.
+
+```{r sentiment-timeline}
+safe_chunk({
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(st)) {
+    cat("Brak danych sentiment_timeline.csv.\n")
+  } else {
+    st <- st %>% mutate(period = suppressWarnings(as.Date(period)))
+
+    ggplot(st, aes(x = period, y = mean_score)) +
+      geom_line(color = "steelblue", linewidth = 0.8) +
+      geom_point(aes(size = n_articles), color = "steelblue", alpha = 0.6) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred", alpha = 0.2) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      scale_size_continuous(range = c(1, 5)) +
+      labs(
+        title = "Sentyment medialny GPW w czasie",
+        x = "Okres",
+        y = "Średni sentyment",
+        size = "Liczba artykułów"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+# Topic modeling (LDA)
+
+```{r topics-lda-k}
+safe_chunk({
+  cat(sprintf("Liczba tematów k = **%d** (parametr `sentiment_lda_k` w constants.R).\n",
+              constants$sentiment_lda_k))
+})
+```
+
+Model LDA przypisuje każdemu artykułowi rozkład prawdopodobieństwa nad k tematami, a każdy temat to rozkład nad słowami. Poniżej top słowa per temat (beta — prawdopodobieństwo słowa w temacie) oraz heatmap przynależności artykułów do tematów (gamma).
+
+## Top słowa per temat
+
+```{r topics-lda-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "topics_lda.png")
+  if (file.exists(path)) {
+    knitr::include_graphics(path)
+  } else {
+    topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+    if (is.null(topics)) {
+      cat("Brak danych topics_lda.csv ani figury topics_lda.png.\n")
+    } else {
+      top_per_topic <- topics %>%
+        group_by(topic) %>%
+        slice_max(beta, n = 10) %>%
+        ungroup() %>%
+        mutate(word = reorder(word, beta))
+
+      ggplot(top_per_topic, aes(x = word, y = beta, fill = factor(topic))) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~ topic, scales = "free_y") +
+        coord_flip() +
+        labs(
+          title = "Top 10 słów per temat (LDA)",
+          x = NULL,
+          y = "Beta"
+        ) +
+        theme_minimal()
+    }
+  }
+})
+```
+
+```{r topics-lda-table}
+safe_chunk({
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(topics)) {
+    cat("Brak danych.\n")
+  } else {
+    top5 <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 5) %>%
+      summarise(top_words = paste(word, collapse = ", "), .groups = "drop")
+    knitr::kable(top5, caption = "Top 5 słów per temat")
+  }
+})
+```
+
+## Heatmap artykuł × temat
+
+```{r topics-gamma-heatmap}
+safe_chunk({
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  if (is.null(gamma)) {
+    cat("Brak danych article_topic_gamma.csv.\n")
+  } else {
+    sample_ids <- unique(gamma$article_id)
+    if (length(sample_ids) > 60) sample_ids <- sample(sample_ids, 60)
+    gamma_sample <- gamma %>% filter(article_id %in% sample_ids)
+
+    ggplot(gamma_sample, aes(x = factor(topic), y = factor(article_id), fill = gamma)) +
+      geom_tile() +
+      scale_fill_gradient(low = "white", high = "darkblue") +
+      labs(
+        title = "Przynależność artykułów do tematów (gamma)",
+        subtitle = sprintf("Próbka %d artykułów", length(sample_ids)),
+        x = "Temat",
+        y = "Artykuł",
+        fill = "Gamma"
+      ) +
+      theme_minimal() +
+      theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  }
+})
+```
+
+# Profile semantyczne spółek (TF-IDF)
+
+TF-IDF wskazuje, które słowa są charakterystyczne dla danej spółki w odniesieniu do całego korpusu — wysoki TF-IDF = słowo często występuje przy konkretnym tickerze, a rzadko gdzie indziej. To pozwala zobaczyć "o czym pisze się przy danej spółce".
+
+```{r tfidf-figure, out.width="95%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "tfidf_per_ticker.png")
+  if (file.exists(path)) {
+    knitr::include_graphics(path)
+  } else {
+    tfidf <- safe_read_csv(constants$tfidf_per_ticker, "tfidf_per_ticker")
+    if (is.null(tfidf)) {
+      cat("Brak danych tfidf_per_ticker.csv ani figury tfidf_per_ticker.png.\n")
+    } else {
+      reorder_within <- function(x, by, within) {
+        new_x <- paste(x, within, sep = "___")
+        stats::reorder(new_x, by)
+      }
+      scale_x_reordered <- function(...) {
+        ggplot2::scale_x_discrete(labels = function(x) gsub("___.+$", "", x), ...)
+      }
+
+      top_tickers <- tfidf %>%
+        group_by(ticker) %>%
+        summarise(total_n = sum(n), .groups = "drop") %>%
+        arrange(desc(total_n)) %>%
+        head(10) %>%
+        pull(ticker)
+
+      top_words <- tfidf %>%
+        filter(ticker %in% top_tickers) %>%
+        group_by(ticker) %>%
+        slice_max(tf_idf, n = 10) %>%
+        ungroup() %>%
+        mutate(word_label = reorder_within(word, tf_idf, ticker))
+
+      ggplot(top_words, aes(x = word_label, y = tf_idf, fill = ticker)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~ ticker, scales = "free", ncol = 2) +
+        coord_flip() +
+        scale_x_reordered() +
+        labs(
+          title = "Top 10 słów charakterystycznych (TF-IDF) — top 10 najpopularniejszych spółek",
+          x = NULL,
+          y = "TF-IDF"
+        ) +
+        theme_minimal()
+    }
+  }
+})
+```
+
+# Wnioski
+
+```{r wnioski}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+
+  if (!is.null(spt)) {
+    spt_signal <- spt %>% filter(n_articles_with_signal > 0)
+    top3_pos <- spt_signal %>% arrange(desc(mean_score)) %>% head(3) %>% pull(ticker)
+    top3_neg <- spt_signal %>% arrange(mean_score) %>% head(3) %>% pull(ticker)
+
+    cat("**Top 3 spółki o najpozytywniejszym sentymencie medialnym:**",
+        paste(top3_pos, collapse = ", "), "\n\n")
+    cat("**Top 3 spółki o najnegatywniejszym sentymencie medialnym:**",
+        paste(top3_neg, collapse = ", "), "\n\n")
+  }
+
+  if (!is.null(topics)) {
+    main_topics <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3) %>%
+      summarise(label = paste(word, collapse = " / "), .groups = "drop")
+    cat("**Główne tematy w korpusie:**\n\n")
+    for (i in seq_len(nrow(main_topics))) {
+      cat(sprintf("- Temat %d: %s\n", main_topics$topic[i], main_topics$label[i]))
+    }
+  }
+})
+```
+
+**Ograniczenia analizy:**
+
+- Rozmiar korpusu ograniczony do artykułów scrapowanych z bankier.pl w wybranym oknie czasowym — przy małej liczbie artykułów per ticker (próg `sentiment_ticker_min_relevance = 5`) ranking może być zaszumiony.
+- Słownik **PL custom** w obecnej wersji to ~30 słów — pełna wersja docelowa rozszerzona o plWordNet emo (~31k) i Loughran-McDonald PL (~4150 słów).
+- Lemmatyzacja modelem `polish-pdb-ud-2.5` — możliwe niedopasowania dla terminologii finansowej (slang giełdowy, skróty).
+- Sentyment leksykonowy nie uchwytuje ironii, kontekstu szerszego niż okno negacji (3 tokeny — `sentiment_negation_window`) i sarkazmu.
+- LDA z k=5 tematów — przy większym korpusie warto eksperymentować z większą wartością k i metryką coherence.
+
+**Pliki źródłowe wyników:** `dataset/processed/`
+
+# Informacje o sesji
+
+<details>
+<summary>Kliknij aby rozwinąć `sessionInfo()`</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>

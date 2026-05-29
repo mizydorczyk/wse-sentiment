@@ -5,3 +5,20 @@ renv/library/
 
 dataset/*
 !dataset/.gitkeep
+!dataset/dictionaries/
+dataset/dictionaries/_*/
+
+CONTEXT.md
+PLAN.md
+
+# plWordNet raw dump (download poza repo)
+*.zip
+*.sql
+
+# DeepL cache i pliki robocze workspace
+*_translations_raw.csv
+
+# R session
+.Rhistory
+.RData
+.Rproj.user/
