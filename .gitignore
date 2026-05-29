@@ -7,7 +7,9 @@ dataset/*
 !dataset/raw
 !dataset/.gitkeep
 !dataset/dictionaries/
+!dataset/processed/
 dataset/dictionaries/_*/
+dataset/processed/*.rds
 
 CONTEXT.md
 PLAN.md
@@ -23,3 +25,4 @@ PLAN.md
 .Rhistory
 .RData
 .Rproj.user/
+.claude/

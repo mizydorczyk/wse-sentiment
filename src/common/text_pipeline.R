@@ -74,26 +74,77 @@ clean_text <- function(x) {
   x
 }
 
-lemmatize_tokens <- function(articles_df, udpipe_model, doc_id_col = "article_id") {
+lemmatize_tokens <- function(articles_df, udpipe_model, doc_id_col = "article_id",
+                             cache_path = NULL, batch_size = 200L) {
+  # Batched udpipe call (default 200 articles/batch) instead of one monster call
+  # over all 9666 — gives progress, allows incremental cache save (resume after kill),
+  # and avoids the silent slowdown observed on huge vector inputs to udpipe_annotate.
+  needed_ids <- unique(articles_df[[doc_id_col]])
+
+  # Resume: if a partial cache exists, skip articles already lemmatized.
+  cached <- NULL
+  if (!is.null(cache_path) && file.exists(cache_path)) {
+    cached <- readRDS(cache_path)
+    cached_ids <- unique(cached$article_id)
+    missing_ids <- setdiff(needed_ids, cached_ids)
+    if (length(missing_ids) == 0) {
+      message(sprintf("Lemmatize cache hit: %s (%d tokens, %d articles)",
+                      cache_path, nrow(cached), length(cached_ids)))
+      return(cached |> filter(.data$article_id %in% needed_ids))
+    }
+    message(sprintf("Lemmatize cache resume: %d/%d articles already done, %d to go",
+                    length(intersect(needed_ids, cached_ids)), length(needed_ids), length(missing_ids)))
+    articles_df <- articles_df |> filter(.data[[doc_id_col]] %in% missing_ids)
+  }
+
   texts <- clean_text(articles_df$text)
   ids <- articles_df[[doc_id_col]]
   unique_idx <- !duplicated(ids)
   unique_texts <- texts[unique_idx]
   unique_ids <- ids[unique_idx]
+  n <- length(unique_ids)
+  message(sprintf("Lemmatizing %d unique articles via udpipe (batch_size=%d)...", n, batch_size))
 
-  annotated <- udpipe_annotate(udpipe_model, x = unique_texts, doc_id = unique_ids)
-  tokens <- as.data.frame(annotated, stringsAsFactors = FALSE)
+  batches <- split(seq_len(n), ceiling(seq_len(n) / batch_size))
+  acc <- if (!is.null(cached)) list(cached) else list()
+  t0 <- Sys.time()
 
-  tokens |>
-    filter(!is.na(.data$lemma), .data$lemma != "") |>
-    transmute(
-      article_id = .data$doc_id,
-      sentence_id = paste0(.data$doc_id, "_s", .data$sentence_id),
-      token_id = as.integer(.data$token_id),
-      token = .data$token,
-      lemma = tolower(.data$lemma),
-      pos = .data$upos
-    )
+  for (b in seq_along(batches)) {
+    idx <- batches[[b]]
+    annotated <- udpipe_annotate(udpipe_model, x = unique_texts[idx], doc_id = unique_ids[idx])
+    batch_tokens <- as.data.frame(annotated, stringsAsFactors = FALSE) |>
+      filter(!is.na(.data$lemma), .data$lemma != "") |>
+      transmute(
+        article_id = .data$doc_id,
+        sentence_id = paste0(.data$doc_id, "_s", .data$sentence_id),
+        token_id = as.integer(.data$token_id),
+        token = .data$token,
+        lemma = tolower(.data$lemma),
+        pos = .data$upos
+      )
+    acc[[length(acc) + 1L]] <- batch_tokens
+
+    done <- b * batch_size
+    elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    rate <- min(done, n) / elapsed
+    eta <- (n - min(done, n)) / max(rate, 0.01)
+    message(sprintf("  batch %d/%d  articles=%d/%d  %.1fs elapsed  %.1f art/s  ETA %.0fs",
+                    b, length(batches), min(done, n), n, elapsed, rate, eta))
+
+    # Save partial cache every 5 batches (1000 articles) for crash resume.
+    if (!is.null(cache_path) && b %% 5 == 0) {
+      if (!dir.exists(dirname(cache_path))) dir.create(dirname(cache_path), recursive = TRUE)
+      saveRDS(bind_rows(acc), cache_path)
+    }
+  }
+
+  result <- bind_rows(acc)
+  if (!is.null(cache_path)) {
+    if (!dir.exists(dirname(cache_path))) dir.create(dirname(cache_path), recursive = TRUE)
+    saveRDS(result, cache_path)
+    message(sprintf("Saved lemmatize cache: %s (%d tokens)", cache_path, nrow(result)))
+  }
+  result |> filter(.data$article_id %in% needed_ids)
 }
 
 load_stopwords_pl <- function(custom_path = constants$stopwords_custom) {
@@ -155,7 +206,11 @@ load_sentiment_lexicon <- function(
     group_by(.data$lemma, .data$pos) |>
     slice_max(.data$priority, n = 1, with_ties = FALSE) |>
     ungroup() |>
-    filter(.data$sentiment %in% c("positive", "negative", "uncertainty", "litigious", "constraining"))
+    filter(.data$sentiment %in% c("positive", "negative", "uncertainty", "litigious", "constraining")) |>
+    # Safety net: only open-class POS can carry sentiment. Function words (ADP, DET,
+    # PRON, CCONJ, SCONJ, AUX, PART, INTJ) leaked from DeepL translations of legal
+    # English ("wherein"→"w", "thereof"→"on") and would flood matches in any text.
+    filter(.data$pos %in% c("NOUN", "VERB", "ADJ", "ADV", "PROPN", "ANY"))
 }
 
 `%||%` <- function(x, y) if (is.null(x) || (length(x) == 1 && is.na(x))) y else x

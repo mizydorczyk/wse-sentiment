@@ -19,7 +19,10 @@ get_articles <- function() {
 get_tokens <- function() {
   if (is.null(cache_env$tokens)) {
     ud_model <- load_udpipe_model()
-    cache_env$tokens <- lemmatize_tokens(get_articles(), ud_model)
+    cache_env$tokens <- lemmatize_tokens(
+      get_articles(), ud_model,
+      cache_path = constants$lemmatized_tokens_cache
+    )
   }
   cache_env$tokens
 }

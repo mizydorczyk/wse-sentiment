@@ -11,12 +11,16 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(wordcloud)
   library(RColorBrewer)
+  library(cluster)
 })
 
 source("src/common/constants.R")
 source("src/common/text_pipeline.R")
 
 content_pos_filter <- c("PUNCT", "NUM", "SYM", "X")
+# Mojibake from ESPI PDF/XHTML attachments — UTF-8 bytes that got double-decoded
+# through CP1250 produce these char sequences. Drop any token containing them.
+mojibake_rx <- "[ňāńôöő≥äé]"
 
 filter_content_tokens <- function(tokens_df, stopwords_vec) {
   tokens_df |>
@@ -25,7 +29,8 @@ filter_content_tokens <- function(tokens_df, stopwords_vec) {
       .data$lemma != "",
       nchar(.data$lemma) >= 3,
       !.data$lemma %in% stopwords_vec,
-      !.data$pos %in% content_pos_filter
+      !.data$pos %in% content_pos_filter,
+      !stringr::str_detect(.data$lemma, mojibake_rx)
     )
 }
 
@@ -84,6 +89,39 @@ extract_article_gamma <- function(lda) {
     arrange(.data$article_id, .data$topic)
 }
 
+# Hard clustering via k-means on TF-IDF-weighted DTM. Complements LDA (soft)
+# with a discrete cluster assignment per article.
+run_kmeans <- function(dtm, k, seed = 1234) {
+  if (nrow(dtm) < k) k <- max(2L, nrow(dtm) - 1L)
+
+  # TF-IDF weight DTM rows (counts → tf-idf), L2 normalize so cosine ≈ euclidean.
+  dtm_tfidf <- tm::weightTfIdf(dtm)
+  m <- as.matrix(dtm_tfidf)
+  norms <- sqrt(rowSums(m * m))
+  norms[norms == 0] <- 1
+  m <- m / norms
+
+  set.seed(seed)
+  stats::kmeans(m, centers = k, nstart = 10, iter.max = 50)
+}
+
+# Top words per k-means cluster by aggregate term frequency within cluster.
+words_per_cluster <- function(km, dtm, top_n = 15) {
+  m <- as.matrix(dtm)
+  clusters <- km$cluster
+  out <- lapply(sort(unique(clusters)), function(cl) {
+    in_cluster <- which(clusters == cl)
+    word_sums <- colSums(m[in_cluster, , drop = FALSE])
+    top <- sort(word_sums, decreasing = TRUE)[seq_len(min(top_n, length(word_sums)))]
+    tibble::tibble(cluster = cl, word = names(top), n = as.integer(top))
+  })
+  bind_rows(out)
+}
+
+cluster_assignments_df <- function(km, dtm) {
+  tibble::tibble(article_id = rownames(dtm), cluster = unname(km$cluster))
+}
+
 compute_tfidf_per_ticker <- function(tokens_df, articles_df, stopwords_vec) {
   filtered <- filter_content_tokens(tokens_df, stopwords_vec)
 
@@ -118,6 +156,29 @@ compute_word_freq <- function(tokens_df, stopwords_vec, top_n = 100) {
     count(.data$lemma, name = "freq") |>
     rename(word = "lemma") |>
     arrange(desc(.data$freq)) |>
+    slice_head(n = top_n)
+}
+
+# Global TF-IDF across the whole corpus. Two complementary views:
+#   - article-level: each article = document, top words by mean tf-idf over articles
+#     where the word appears. Highlights informative words after subtracting "klasyki"
+#     (very-frequent words get high TF but low IDF → low TF-IDF).
+#   - ticker-level: sum tf-idf across tickers (using existing per-ticker output) — words
+#     that show up as distinctive for many companies.
+compute_tfidf_global <- function(dtm, top_n = 100) {
+  dtm_tfidf <- tm::weightTfIdf(dtm)
+  m <- as.matrix(dtm_tfidf)
+  # For each word: mean tf-idf over docs where word is present, plus doc frequency.
+  doc_freq <- colSums(m > 0)
+  sum_tfidf <- colSums(m)
+  mean_tfidf <- ifelse(doc_freq > 0, sum_tfidf / doc_freq, 0)
+  tibble::tibble(
+    word = colnames(m),
+    doc_freq = unname(doc_freq),
+    sum_tfidf = unname(sum_tfidf),
+    mean_tfidf = unname(mean_tfidf)
+  ) |>
+    arrange(desc(.data$sum_tfidf)) |>
     slice_head(n = top_n)
 }
 
@@ -272,7 +333,90 @@ plot_wordcloud_per_topic <- function(beta_df, k, filename_prefix = "wordcloud_to
   invisible(outpaths)
 }
 
-save_outputs <- function(beta, gamma, tfidf, freq) {
+plot_tfidf_global <- function(global_df, filename = "tfidf_global.png", top_n = 30) {
+  ensure_figures_dir()
+  top <- global_df |>
+    arrange(desc(.data$sum_tfidf)) |>
+    slice_head(n = top_n) |>
+    mutate(word = factor(.data$word, levels = rev(.data$word)))
+
+  p <- ggplot(top, aes(x = .data$sum_tfidf, y = .data$word)) +
+    geom_col(fill = "steelblue") +
+    labs(title = sprintf("Globalny TF-IDF — top %d slow", top_n),
+         subtitle = "suma tf-idf po wszystkich artykulach (article = dokument)",
+         x = "sum tf-idf", y = NULL) +
+    theme_minimal(base_size = 11)
+
+  outpath <- file.path(constants$figures_directory, filename)
+  ggsave(outpath, p, width = 9, height = 8, dpi = 150, units = "in")
+  invisible(outpath)
+}
+
+plot_kmeans_words_facet <- function(words_df, filename = "kmeans_words.png", top_n = 10) {
+  ensure_figures_dir()
+  plot_df <- words_df |>
+    group_by(.data$cluster) |>
+    slice_max(.data$n, n = top_n, with_ties = FALSE) |>
+    ungroup() |>
+    mutate(
+      cluster = factor(.data$cluster),
+      word = tidytext::reorder_within(.data$word, .data$n, .data$cluster)
+    )
+
+  p <- ggplot(plot_df, aes(x = .data$n, y = .data$word, fill = .data$cluster)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ .data$cluster, scales = "free", labeller = label_both) +
+    tidytext::scale_y_reordered() +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "k-means — top slowa per klaster",
+         x = "liczba wystapien", y = NULL) +
+    theme_minimal(base_size = 11)
+
+  outpath <- file.path(constants$figures_directory, filename)
+  ggsave(outpath, p, width = 10, height = 8, dpi = 150, units = "in")
+  invisible(outpath)
+}
+
+plot_kmeans_sizes <- function(assignments_df, filename = "kmeans_sizes.png") {
+  ensure_figures_dir()
+  sizes <- assignments_df |>
+    count(.data$cluster, name = "n_articles") |>
+    mutate(cluster = factor(.data$cluster))
+
+  p <- ggplot(sizes, aes(x = .data$cluster, y = .data$n_articles, fill = .data$cluster)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = .data$n_articles), vjust = -0.3, size = 4) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "k-means — liczba artykulow per klaster",
+         x = "klaster", y = "n_articles") +
+    theme_minimal(base_size = 12)
+
+  outpath <- file.path(constants$figures_directory, filename)
+  ggsave(outpath, p, width = 9, height = 5, dpi = 150, units = "in")
+  invisible(outpath)
+}
+
+plot_wordcloud_per_cluster <- function(words_df, filename_prefix = "wordcloud_cluster") {
+  ensure_figures_dir()
+  clusters <- sort(unique(words_df$cluster))
+  for (cl in clusters) {
+    sub <- words_df |> filter(.data$cluster == cl) |> arrange(desc(.data$n))
+    if (nrow(sub) == 0) next
+    outpath <- file.path(constants$figures_directory,
+                         sprintf("%s_%d.png", filename_prefix, cl))
+    tryCatch({
+      png(outpath, width = 10, height = 8, units = "in", res = 150)
+      on.exit(dev.off(), add = TRUE)
+      wordcloud(sub$word, freq = sub$n, max.words = nrow(sub), min.freq = 1,
+                random.order = FALSE, rot.per = 0.2,
+                colors = brewer.pal(8, "Dark2"), scale = c(4, 0.6))
+    }, error = function(e) message("Cluster wordcloud failed: ", conditionMessage(e)))
+  }
+  invisible(NULL)
+}
+
+save_outputs <- function(beta, gamma, tfidf, freq, km_assign = NULL, km_words = NULL,
+                         tfidf_glob = NULL) {
   if (!dir.exists(constants$processed_directory)) {
     dir.create(constants$processed_directory, recursive = TRUE)
   }
@@ -281,13 +425,17 @@ save_outputs <- function(beta, gamma, tfidf, freq) {
   write.csv(gamma, constants$article_topic_gamma, row.names = FALSE, fileEncoding = "UTF-8")
   write.csv(tfidf, constants$tfidf_per_ticker, row.names = FALSE, fileEncoding = "UTF-8")
   write.csv(freq, constants$word_freq, row.names = FALSE, fileEncoding = "UTF-8")
+  if (!is.null(km_assign)) {
+    write.csv(km_assign, constants$kmeans_assignments, row.names = FALSE, fileEncoding = "UTF-8")
+  }
+  if (!is.null(km_words)) {
+    write.csv(km_words, constants$kmeans_words_per_cluster, row.names = FALSE, fileEncoding = "UTF-8")
+  }
+  if (!is.null(tfidf_glob)) {
+    write.csv(tfidf_glob, constants$tfidf_global, row.names = FALSE, fileEncoding = "UTF-8")
+  }
 
-  invisible(list(
-    topics_lda = constants$topics_lda,
-    article_topic_gamma = constants$article_topic_gamma,
-    tfidf_per_ticker = constants$tfidf_per_ticker,
-    word_freq = constants$word_freq
-  ))
+  invisible(NULL)
 }
 
 run_clustering_pipeline <- function() {
@@ -297,7 +445,7 @@ run_clustering_pipeline <- function() {
 
   message(sprintf("Loaded %d unique articles. Lemmatizing...", n_articles))
   ud_model <- load_udpipe_model()
-  tokens_df <- lemmatize_tokens(articles_df, ud_model)
+  tokens_df <- lemmatize_tokens(articles_df, ud_model, cache_path = constants$lemmatized_tokens_cache)
   stopwords_vec <- load_stopwords_pl()
 
   message("Building DTM...")
@@ -316,14 +464,29 @@ run_clustering_pipeline <- function() {
   tfidf <- compute_tfidf_per_ticker(tokens_df, articles_df, stopwords_vec)
   freq <- compute_word_freq(tokens_df, stopwords_vec, top_n = 100)
 
+  message("Computing global TF-IDF (article-level)...")
+  tfidf_glob <- compute_tfidf_global(dtm, top_n = 100)
+
+  k_km <- constants$sentiment_kmeans_k %||% 6L
+  message(sprintf("Running k-means with k = %d on TF-IDF DTM...", k_km))
+  km <- run_kmeans(dtm, k_km)
+  km_assign <- cluster_assignments_df(km, dtm)
+  km_words <- words_per_cluster(km, dtm, top_n = 20)
+  message(sprintf("k-means cluster sizes: %s",
+                  paste(table(km_assign$cluster), collapse = " / ")))
+
   message("Saving CSV outputs...")
-  save_outputs(beta, gamma, tfidf, freq)
+  save_outputs(beta, gamma, tfidf, freq, km_assign, km_words, tfidf_glob)
 
   message("Generating plots...")
   plot_topics_facet(beta)
   plot_tfidf_facet(tfidf)
+  plot_tfidf_global(tfidf_glob)
   plot_wordcloud_global(freq)
   plot_wordcloud_per_topic(beta, k_used)
+  plot_kmeans_words_facet(km_words)
+  plot_kmeans_sizes(km_assign)
+  plot_wordcloud_per_cluster(km_words)
 
   top_per_topic <- beta |>
     group_by(.data$topic) |>

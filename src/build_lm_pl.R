@@ -6,7 +6,7 @@ suppressPackageStartupMessages({
   library(readr)
   library(stringr)
   library(udpipe)
-  library(deeplr)
+  library(httr)
 })
 
 source("src/common/constants.R")
@@ -15,7 +15,8 @@ source("src/common/text_pipeline.R")
 loughran_path <- file.path(
   Sys.getenv("HOME"),
   "repo", "Projektowanie_systemow_informatycznych_2026",
-  "04.Zajecia", "_Slowniki_w_CSV", "loughran.csv"
+  "04.Zajecia_Gromadzenie_i_analiza_wymagan_Analiza_sentymentu",
+  "_Slowniki_w_CSV", "loughran.csv"
 )
 
 lm_cache_path <- file.path(constants$workspace_cache, "lm_translations_raw.csv")
@@ -71,63 +72,108 @@ save_cache <- function(cache_df, cache_path = lm_cache_path) {
   write_csv(cache_df, cache_path)
 }
 
-translate_word <- function(word, auth_key) {
-  tryCatch(
-    {
-      out <- deeplr::translate2(
-        text = word,
-        target_lang = "PL",
-        source_lang = "EN",
-        auth_key = auth_key
-      )
-      list(translation = as.character(out), status = "ok")
-    },
-    error = function(e) {
-      list(translation = NA_character_, status = paste0("error_", substr(conditionMessage(e), 1, 200)))
-    }
+translate_batch <- function(words, auth_key, max_retries = 3L) {
+  # DeepL accepts multiple text= parameters in one POST; result preserves order.
+  # Reduces request count 50x vs per-word calls — critical to avoid Free tier rate limit.
+  # 429 retry with exponential backoff because rate limits are time-windowed, not budget.
+  body <- c(
+    list(source_lang = "EN", target_lang = "PL"),
+    stats::setNames(as.list(words), rep("text", length(words)))
   )
+
+  for (attempt in seq_len(max_retries)) {
+    r <- tryCatch(
+      httr::POST(
+        url = "https://api-free.deepl.com/v2/translate",
+        body = body,
+        encode = "form",
+        httr::add_headers("Authorization" = paste("DeepL-Auth-Key", auth_key))
+      ),
+      error = function(e) e
+    )
+    if (inherits(r, "error")) {
+      if (attempt == max_retries) {
+        return(list(translations = rep(NA_character_, length(words)),
+                    statuses = rep(paste0("error_", substr(conditionMessage(r), 1, 200)), length(words))))
+      }
+      Sys.sleep(2 ^ attempt)
+      next
+    }
+    sc <- httr::status_code(r)
+    if (sc == 200) {
+      payload <- httr::content(r)$translations
+      tr <- vapply(payload, function(x) x$text, character(1))
+      return(list(translations = tr, statuses = rep("ok", length(words))))
+    }
+    if (sc == 429 && attempt < max_retries) {
+      Sys.sleep(2 ^ attempt)
+      next
+    }
+    body_snippet <- substr(rawToChar(httr::content(r, as = "raw")), 1, 200)
+    return(list(translations = rep(NA_character_, length(words)),
+                statuses = rep(sprintf("http_%d_%s", sc, body_snippet), length(words))))
+  }
 }
 
-translate_all <- function(lm_df, auth_key, cache_path = lm_cache_path, save_every = 100L, sleep_s = 0.05) {
+translate_all <- function(lm_df, auth_key, cache_path = lm_cache_path,
+                          batch_size = 50L, sleep_s = 1.0,
+                          char_budget = 200000L) {
   cache <- load_cache(cache_path)
   already_done <- cache$word_en
 
   todo <- lm_df |> filter(!.data$word %in% already_done)
-  message(sprintf("Cache hits: %d, to translate: %d", length(already_done), nrow(todo)))
+  message(sprintf("Cache hits: %d, to translate: %d in batches of %d (char budget this run: %d)",
+                  length(already_done), nrow(todo), batch_size, char_budget))
 
   if (nrow(todo) == 0) return(cache)
 
-  acc <- vector("list", nrow(todo))
-  n_since_save <- 0L
+  n_total <- nrow(todo)
+  batches <- split(seq_len(n_total), ceiling(seq_len(n_total) / batch_size))
+  chars_sent <- 0L
+  budget_hit <- FALSE
+  acc <- vector("list", length(batches))
 
-  for (i in seq_len(nrow(todo))) {
-    w <- todo$word[i]
-    s <- todo$sentiment[i]
-    res <- translate_word(w, auth_key)
-    acc[[i]] <- tibble(
-      word_en = w,
-      sentiment_en = s,
-      translation_pl = res$translation,
-      status = res$status
+  for (b in seq_along(batches)) {
+    idx <- batches[[b]]
+    words <- todo$word[idx]
+    sents <- todo$sentiment[idx]
+    batch_chars <- sum(nchar(words))
+
+    if (chars_sent + batch_chars > char_budget) {
+      budget_hit <- TRUE
+      message(sprintf("  >>> char budget %d would be exceeded by batch %d (chars_sent=%d, batch_chars=%d). Stopping.",
+                      char_budget, b, chars_sent, batch_chars))
+      break
+    }
+
+    res <- translate_batch(words, auth_key)
+    acc[[b]] <- tibble(
+      word_en = words,
+      sentiment_en = sents,
+      translation_pl = res$translations,
+      status = res$statuses
     )
-    n_since_save <- n_since_save + 1L
+    n_ok <- sum(res$statuses == "ok")
+    chars_sent <- chars_sent + batch_chars
 
-    if (sleep_s > 0) Sys.sleep(sleep_s)
-
-    if (n_since_save >= save_every) {
-      new_chunk <- bind_rows(acc[seq_len(i)])
-      combined <- bind_rows(cache, new_chunk) |>
+    if (b %% 5 == 0 || b == length(batches)) {
+      combined <- bind_rows(cache, bind_rows(acc[seq_len(b)])) |>
         distinct(.data$word_en, .keep_all = TRUE)
       save_cache(combined, cache_path)
-      message(sprintf("  saved cache at %d / %d", i, nrow(todo)))
-      n_since_save <- 0L
+      message(sprintf("  batch %d/%d  done=%d  ok_this_batch=%d/%d  chars=%d/%d",
+                      b, length(batches), b * batch_size, n_ok, length(words),
+                      chars_sent, char_budget))
     }
+
+    if (sleep_s > 0) Sys.sleep(sleep_s)
   }
 
-  new_rows <- bind_rows(acc)
-  combined <- bind_rows(cache, new_rows) |>
+  combined <- bind_rows(cache, bind_rows(acc[!sapply(acc, is.null)])) |>
     distinct(.data$word_en, .keep_all = TRUE)
   save_cache(combined, cache_path)
+  message(sprintf("Final: %d batches done, %d chars sent to DeepL%s",
+                  sum(!sapply(acc, is.null)), chars_sent,
+                  if (budget_hit) " (BUDGET HIT — re-run to continue from cache)" else ""))
   combined
 }
 
@@ -148,7 +194,10 @@ select_main_token <- function(tokens_df) {
       return(list(lemma = tolower(hit$lemma[1]), pos = hit$upos[1]))
     }
   }
-  list(lemma = tolower(clean$lemma[1]), pos = clean$upos[1])
+  # Drop instead of fallback — function-word fallback caused English legal terms
+  # ("wherein", "thereof") to translate to Polish prepositions ("w", "z") and
+  # flood sentiment matches with 100k+ false positives.
+  list(lemma = NA_character_, pos = NA_character_)
 }
 
 lemmatize_translations <- function(translations_df, ud_model) {
@@ -215,7 +264,9 @@ dedupe_lemmas <- function(df) {
 dry_run <- function(n = 10) {
   auth_key <- Sys.getenv("DEEPL_API_KEY")
   if (!nzchar(auth_key)) {
-    stop("DEEPL_API_KEY env var not set. Register at https://www.deepl.com/pro-api and add `DEEPL_API_KEY=xxx:fx` to ~/.Renviron")
+    stop(paste0("DEEPL_API_KEY env var not set. ",
+                "Register at https://www.deepl.com/pro-api ",
+                "and add `DEEPL_API_KEY=xxx:fx` to ~/.Renviron"))
   }
   lm_df <- load_lm_source() |> head(n)
   message(sprintf("Dry run on %d words", nrow(lm_df)))

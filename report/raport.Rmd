@@ -1,7 +1,7 @@
 ---
 title: "Analiza sentymentu i tematów artykułów finansowych GPW"
 subtitle: "Projekt zaliczeniowy PSI 2026"
-author: "fzablocki"
+author: "Liszniańska, Izydorczyk, Zabłocki"
 date: "`r format(Sys.Date(), '%d.%m.%Y')`"
 output:
   html_document:
@@ -54,7 +54,7 @@ safe_read_json <- function(path, label) {
   jsonlite::fromJSON(path, simplifyDataFrame = TRUE)
 }
 
-safe_chunk <- function(expr, fallback_msg = "Dane jeszcze niedostępne — uruchom pipeline aby wygenerować.") {
+safe_chunk <- function(expr, fallback_msg = "Dane jeszcze niedostępne - uruchom pipeline aby wygenerować.") {
   tryCatch(expr, error = function(e) {
     cat(fallback_msg, "\n")
     cat("Błąd:", conditionMessage(e), "\n")
@@ -69,9 +69,9 @@ fmt_pct <- function(x) scales::percent(x, accuracy = 0.1)
 
 Celem projektu jest zbudowanie pipeline'u automatycznej analizy tekstów finansowych z serwisu **bankier.pl**, który dla każdej spółki notowanej na **Giełdzie Papierów Wartościowych w Warszawie (GPW)** wyciąga sygnał sentymentu medialnego oraz identyfikuje główne tematy poruszane w artykułach. Praca powstała w ramach przedmiotu *Projektowanie Systemów Informatycznych* (PSI) na semestr 2026.
 
-Źródłem danych są artykuły scrapowane z bankier.pl — zarówno bieżące przez RSS, jak i historyczne przez archiwum portalu. Tickery spółek GPW przypisywane są automatycznie do każdego artykułu na podstawie wykrywania wystąpień nazw firm i symboli giełdowych w tekście (skrypt `src/data_ingestion/assign_tickers.R`).
+Źródłem danych są artykuły scrapowane z bankier.pl - zarówno bieżące przez RSS, jak i historyczne przez archiwum portalu. Tickery spółek GPW przypisywane są automatycznie do każdego artykułu na podstawie wykrywania wystąpień nazw firm i symboli giełdowych w tekście (skrypt `src/data_ingestion/assign_tickers.R`).
 
-Zastosowano cztery techniki text miningu: (1) **leksykonową analizę sentymentu** opartą na zhybrydyzowanym słowniku polskim, (2) **modelowanie tematyczne LDA** (Latent Dirichlet Allocation), (3) **TF-IDF** profile semantyczne per spółka oraz (4) analizę **częstości słów** wraz z chmurą słów. Raport prezentuje wyniki — kod analizy znajduje się w `src/sentiment/sentiment.R` oraz `src/clustering/clustering.R`.
+Zastosowano pięć technik text miningu: (1) **leksykonową analizę sentymentu** opartą na zhybrydyzowanym słowniku polskim (LM-PL + plWordNet + custom finansowy), (2) **klastrowanie k-means** (hard clustering) artykułów na bazie macierzy TF-IDF, (3) **modelowanie tematyczne LDA** (Latent Dirichlet Allocation - soft clustering), (4) **TF-IDF** profile semantyczne per spółka oraz (5) analizę **częstości słów** wraz z chmurą słów. Raport prezentuje wyniki - kod analizy znajduje się w `src/sentiment.R` oraz `src/clustering.R`.
 
 # Dane i preprocessing
 
@@ -79,46 +79,69 @@ Pipeline danych obejmuje następujące etapy: pobranie listy artykułów (RSS + 
 
 **Słowniki sentymentu** stanowią hybrydę trzech źródeł:
 
-- **plWordNet emo** — ogólnotematyczny słownik emocji dla języka polskiego (~31 000 słów),
-- **Loughran-McDonald PL** — finansowy słownik LM przetłumaczony na polski (~4 150 słów),
-- **Custom PL** — własny minisłownik specyficzny dla domeny GPW (~30 słów).
+- **plWordNet emo** - ogólnotematyczny słownik emocji dla języka polskiego, po parsowaniu z dumpu SQL i mappingu POS do UD: **18 884 wpisów** (NOUN/VERB/ADJ/ADV, sentiment positive/negative),
+- **Loughran-McDonald PL** - finansowy słownik LM przetłumaczony przez DeepL API + lematyzacja udpipe + filtr open-class POS + manual review top-50 (dropping mistranslated prefixed terms): **2 206 wpisów** (kategorie: positive, negative, uncertainty, litigious, constraining),
+- **Custom PL** - własny minisłownik specyficzny dla domeny GPW (hossa/bessa/rajd, dywidenda/inwestycja, frankowicze/KNF/WIBOR itd.): **162 wpisy**, najwyższy priorytet (override LM_PL i plWN).
 
-**Stopwords** to lista `stopwords-iso` dla języka polskiego rozszerzona o ~22 słowa domenowe (np. *spółka*, *akcja*, *rynek* — neutralne w kontekście).
+**Stopwords** to lista `stopwords-iso` dla języka polskiego (~342 słowa) rozszerzona o **38 słów domenowych**: 22 neutralne biznesowe (np. *artykuł*, *informacja*, *komunikat*) oraz 16 artefaktów scrapingu (rozszerzenia plików: `xhtml`, `xades`, `pdf`, `xls`, `html` itd.). Dodatkowo filtr w pipeline odrzuca tokeny zawierające bajty mojibake z niepoprawnie odkodowanych załączników ESPI.
 
 ```{r dane-summary}
 safe_chunk({
+  library(lubridate)
   manifest <- safe_read_json(constants$processed_manifest_file, "manifest artykułów")
-  if (is.null(manifest)) {
-    cat("Manifest artykułów jeszcze niedostępny.\n")
-  } else {
-    df <- if (is.data.frame(manifest)) manifest else as.data.frame(manifest)
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  tokens <- if (file.exists(constants$lemmatized_tokens_cache)) {
+    readRDS(constants$lemmatized_tokens_cache)
+  } else NULL
 
-    n_articles <- nrow(df)
-    date_col <- intersect(c("date", "published", "pub_date", "published_at"), names(df))[1]
-    date_range <- if (!is.na(date_col) && !is.null(date_col)) {
-      d <- suppressWarnings(as.Date(df[[date_col]]))
-      sprintf("%s — %s", min(d, na.rm = TRUE), max(d, na.rm = TRUE))
-    } else "n/d"
+  n_articles <- if (!is.null(manifest)) length(manifest) else NA_integer_
 
-    ticker_col <- intersect(c("tickers", "ticker", "assigned_tickers"), names(df))[1]
-    n_tickers <- if (!is.na(ticker_col) && !is.null(ticker_col)) {
-      vals <- df[[ticker_col]]
-      if (is.list(vals)) length(unique(unlist(vals))) else length(unique(unlist(strsplit(as.character(vals), "[,;\\s]+"))))
-    } else NA_integer_
+  date_range <- if (!is.null(dates)) {
+    d <- suppressWarnings(ymd_hm(dates$publication_date, quiet = TRUE))
+    d <- as.Date(d)
+    d <- d[!is.na(d)]
+    if (length(d) > 0) sprintf("%s - %s", min(d), max(d)) else "n/d"
+  } else "n/d"
 
-    text_col <- intersect(c("text", "body", "content"), names(df))[1]
-    mean_len <- if (!is.na(text_col) && !is.null(text_col)) {
-      round(mean(nchar(df[[text_col]]), na.rm = TRUE))
-    } else NA_integer_
+  # Unique tickers attributed to at least one article (from processed manifest)
+  n_tickers <- if (!is.null(manifest)) {
+    ts <- unlist(lapply(manifest, function(x) {
+      if (length(x$tickers) == 0) character(0)
+      else vapply(x$tickers, function(t) t$ticker, character(1))
+    }))
+    length(unique(ts))
+  } else NA_integer_
 
-    summary_tbl <- data.frame(
-      Metryka = c("Liczba artykułów", "Zakres dat", "Liczba unikalnych tickerów", "Średnia długość artykułu (znaki)"),
-      Wartość = c(fmt_int(n_articles), date_range,
-                  ifelse(is.na(n_tickers), "n/d", fmt_int(n_tickers)),
-                  ifelse(is.na(mean_len), "n/d", fmt_int(mean_len)))
-    )
-    knitr::kable(summary_tbl, caption = "Podsumowanie korpusu artykułów")
-  }
+  # Articles with at least one ticker
+  n_with_ticker <- if (!is.null(manifest)) {
+    sum(vapply(manifest, function(x) length(x$tickers) > 0, logical(1)))
+  } else NA_integer_
+
+  # Mean article length in tokens (lemmatized - proxy for length).
+  mean_tokens <- if (!is.null(tokens)) {
+    counts <- tokens |> dplyr::count(.data$article_id, name = "n_tokens")
+    round(mean(counts$n_tokens))
+  } else NA_integer_
+
+  total_tokens <- if (!is.null(tokens)) nrow(tokens) else NA_integer_
+
+  summary_tbl <- data.frame(
+    Metryka = c("Liczba artykułów",
+                "Zakres dat (publikacja)",
+                "Artykuły z przypisanym tickerem",
+                "Liczba unikalnych tickerów (z manifestu)",
+                "Łączna liczba tokenów (po lematyzacji)",
+                "Średnia liczba tokenów / artykuł"),
+    Wartość = c(fmt_int(n_articles),
+                date_range,
+                ifelse(is.na(n_with_ticker), "n/d",
+                       sprintf("%s (%.0f%%)", fmt_int(n_with_ticker),
+                               100 * n_with_ticker / max(n_articles, 1))),
+                ifelse(is.na(n_tickers), "n/d", fmt_int(n_tickers)),
+                ifelse(is.na(total_tokens), "n/d", fmt_int(total_tokens)),
+                ifelse(is.na(mean_tokens), "n/d", fmt_int(mean_tokens)))
+  )
+  knitr::kable(summary_tbl, caption = "Podsumowanie korpusu artykułów")
 })
 ```
 
@@ -130,7 +153,7 @@ safe_chunk({
 safe_chunk({
   wf <- safe_read_csv(constants$word_freq, "word_freq")
   if (is.null(wf)) {
-    cat("Brak danych word_freq.csv — uruchom pipeline tokenizacji.\n")
+    cat("Brak danych word_freq.csv - uruchom pipeline tokenizacji.\n")
   } else {
     top30 <- wf %>%
       arrange(desc(freq)) %>%
@@ -157,7 +180,7 @@ safe_chunk({
 safe_chunk({
   path <- file.path(constants$figures_directory, "wordcloud_global.png")
   if (!file.exists(path)) {
-    cat("Brak pliku", path, "— wygeneruj wordcloud w pipeline.\n")
+    cat("Brak pliku", path, "- wygeneruj wordcloud w pipeline.\n")
   } else {
     knitr::include_graphics(path)
   }
@@ -226,7 +249,7 @@ safe_chunk({
 
 ## Sentyment per artykuł
 
-Rozkład wyników sentymentu na poziomie pojedynczego artykułu — pozwala zobaczyć ogólny kształt korpusu (czy dominują nastroje pozytywne, neutralne czy negatywne).
+Rozkład wyników sentymentu na poziomie pojedynczego artykułu - pozwala zobaczyć ogólny kształt korpusu (czy dominują nastroje pozytywne, neutralne czy negatywne).
 
 ```{r sentiment-per-article-hist}
 safe_chunk({
@@ -269,7 +292,7 @@ safe_chunk({
 
 ## Sentyment GPW w czasie
 
-Linia trendu sentymentu medialnego w czasie — granularność tygodniowa (parametr `sentiment_timeline_granularity` w `constants.R`). Linia wygładzona (`geom_smooth`) pokazuje średnioterminowy trend.
+Linia trendu sentymentu medialnego w czasie - granularność tygodniowa (parametr `sentiment_timeline_granularity` w `constants.R`). Linia wygładzona (`geom_smooth`) pokazuje średnioterminowy trend.
 
 ```{r sentiment-timeline}
 safe_chunk({
@@ -296,6 +319,398 @@ safe_chunk({
 })
 ```
 
+### Sentyment vs główne tematy w czasie
+
+Sentyment w czasie z nałożeniem udziału klastrów tematycznych (k-means) - dolny panel pokazuje proporcję artykułów przypisanych do danego klastra w każdym miesiącu, górny powtarza sentyment z miesięczną granularnością. Pozwala zobaczyć **czy zmiany sentymentu nakładają się na zmiany struktury tematycznej** (np. wzrost klastra "ropa/paliwa" w okresie kryzysu może korelować z neg sentymentem).
+
+```{r sentiment-vs-topics, fig.width=11, fig.height=11}
+safe_chunk({
+  library(lubridate)
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  sent <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  km <- safe_read_csv(constants$kmeans_assignments, "kmeans_assignments")
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(dates) || is.null(sent) || is.null(km)) {
+    cat("Brak danych do overlay sentiment vs topics.\n")
+  } else {
+    cluster_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(label = sprintf("C%d: %s", first(cluster),
+                                paste(word, collapse = ", ")), .groups = "drop")
+
+    merged <- sent %>%
+      inner_join(dates, by = "article_id") %>%
+      inner_join(km, by = "article_id") %>%
+      mutate(
+        date = suppressWarnings(ymd_hm(publication_date, quiet = TRUE)),
+        date = as.Date(date),
+        period = floor_date(date, "week")
+      ) %>%
+      filter(!is.na(period))
+
+    sent_w <- merged %>%
+      group_by(period) %>%
+      summarise(mean_score = mean(score, na.rm = TRUE),
+                n = dplyr::n(), .groups = "drop")
+
+    cluster_share <- merged %>%
+      count(period, cluster, name = "n_in_cluster") %>%
+      group_by(period) %>%
+      mutate(share = n_in_cluster / sum(n_in_cluster)) %>%
+      ungroup() %>%
+      left_join(cluster_labels, by = "cluster") %>%
+      mutate(label = factor(label, levels = rev(cluster_labels$label)))
+
+    date_range <- range(merged$period, na.rm = TRUE)
+
+    p1 <- ggplot(sent_w, aes(x = period, y = mean_score)) +
+      geom_line(color = "steelblue", linewidth = 0.5, alpha = 0.7) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred",
+                  fill = "darkred", alpha = 0.15, linewidth = 0.9) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y") +
+      labs(title = "Sentyment GPW (mean score per tydzien)",
+           x = NULL, y = "Mean score") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    p2 <- ggplot(cluster_share, aes(x = period, y = label, fill = share)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "rocket", direction = -1,
+                           labels = scales::percent_format(accuracy = 1)) +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y",
+                   expand = c(0, 0)) +
+      labs(title = "Udzial klastrow k-means w czasie (heatmap, tygodniowo)",
+           x = NULL, y = NULL, fill = "Udzial") +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            legend.position = "right")
+
+    # LDA topic shares - mean gamma per topic per period
+    lda_share <- merged %>%
+      select(article_id, period) %>%
+      inner_join(gamma, by = "article_id") %>%
+      group_by(period, topic) %>%
+      summarise(mean_gamma = mean(gamma), .groups = "drop")
+
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(label = sprintf("T%d: %s", first(topic),
+                                paste(term, collapse = ", ")), .groups = "drop")
+
+    lda_share <- lda_share %>%
+      left_join(lda_labels, by = "topic") %>%
+      mutate(label = factor(label, levels = rev(lda_labels$label)))
+
+    p3 <- ggplot(lda_share, aes(x = period, y = label, fill = mean_gamma)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "mako", direction = -1,
+                           labels = scales::percent_format(accuracy = 1)) +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y",
+                   expand = c(0, 0)) +
+      labs(title = "Udzial tematow LDA w czasie (heatmap, tygodniowo)",
+           x = "Rok", y = NULL, fill = "Mean gamma") +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid = element_blank(),
+            legend.position = "right")
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      cowplot::plot_grid(p1, p2, p3, ncol = 1, align = "v",
+                         rel_heights = c(0.3, 0.35, 0.35))
+    } else {
+      print(p1); print(p2); print(p3)
+    }
+  }
+})
+```
+
+### Dominujący temat per miesiąc (k-means + LDA)
+
+Dla każdego miesiąca dominujący **klaster k-means** (z top słowami) oraz dominujący **LDA topic** (z top słowami). Pozwala szybko prześledzić "o czym pisał się rynek" miesiąc po miesiącu.
+
+```{r dominant-topics-per-month, fig.width=14, fig.height=7}
+safe_chunk({
+  library(lubridate)
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  km <- safe_read_csv(constants$kmeans_assignments, "kmeans_assignments")
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(dates) || is.null(km) || is.null(km_words) || is.null(gamma) || is.null(topics)) {
+    cat("Brak danych.\n")
+  } else {
+    km_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(km_label = paste(word, collapse = ", "), .groups = "drop")
+
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lda_label = paste(term, collapse = ", "), .groups = "drop")
+
+    article_period <- dates %>%
+      mutate(date = suppressWarnings(ymd_hm(publication_date, quiet = TRUE)),
+             date = as.Date(date),
+             period = floor_date(date, "month")) %>%
+      filter(!is.na(period)) %>%
+      select(article_id, period)
+
+    # No agressive filter - drop only months with <3 articles (single-article noise).
+    n_per_month <- article_period %>% count(period, name = "n_articles")
+    good_periods <- n_per_month %>% filter(n_articles >= 3) %>% pull(period)
+
+    dom_km <- article_period %>%
+      filter(period %in% good_periods) %>%
+      inner_join(km, by = "article_id") %>%
+      count(period, cluster) %>%
+      group_by(period) %>%
+      slice_max(n, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      left_join(km_labels, by = "cluster") %>%
+      mutate(row = "Dominujacy k-means klaster",
+             label = sprintf("C%d", cluster))
+
+    dom_lda <- article_period %>%
+      filter(period %in% good_periods) %>%
+      inner_join(gamma, by = "article_id") %>%
+      group_by(period, topic) %>%
+      summarise(mean_gamma = mean(gamma), .groups = "drop") %>%
+      group_by(period) %>%
+      slice_max(mean_gamma, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      left_join(lda_labels, by = "topic") %>%
+      mutate(row = "Dominujacy LDA temat",
+             label = sprintf("T%d", topic))
+
+    combined <- bind_rows(
+      dom_km %>% transmute(period, row, label, value = factor(cluster)),
+      dom_lda %>% transmute(period, row, label, value = factor(topic))
+    )
+
+    # Split into two halves by date so each tile gets ~2x more horizontal space.
+    median_date <- as.Date(median(as.numeric(combined$period), na.rm = TRUE),
+                           origin = "1970-01-01")
+    p_top <- combined %>% filter(period <= median_date)
+    p_bot <- combined %>% filter(period > median_date)
+
+    make_panel <- function(df, title_suffix) {
+      ggplot(df, aes(x = period, y = row, fill = value)) +
+        geom_tile(color = "white", linewidth = 0.3) +
+        geom_text(aes(label = label), size = 3.2, fontface = "bold") +
+        scale_fill_brewer(palette = "Set3", guide = "none") +
+        scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m",
+                     expand = c(0.01, 0.01)) +
+        labs(title = title_suffix, x = NULL, y = NULL) +
+        theme_minimal(base_size = 10) +
+        theme(panel.grid = element_blank(),
+              axis.text.y = element_text(face = "bold"),
+              axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+    }
+
+    pA <- make_panel(p_top, sprintf("Dominujacy temat: %s - %s",
+                                    format(min(p_top$period), "%Y-%m"),
+                                    format(max(p_top$period), "%Y-%m")))
+    pB <- make_panel(p_bot, sprintf("Dominujacy temat: %s - %s",
+                                    format(min(p_bot$period), "%Y-%m"),
+                                    format(max(p_bot$period), "%Y-%m")))
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(pA, pB, ncol = 1, align = "v"))
+    } else {
+      print(pA); print(pB)
+    }
+  }
+})
+```
+
+```{r dominant-topics-legend, results="asis"}
+safe_chunk({
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (!is.null(km_words) && !is.null(topics)) {
+    km_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(km_label = paste(word, collapse = ", "), .groups = "drop")
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lda_label = paste(term, collapse = ", "), .groups = "drop")
+
+    cat("**Legenda klastrów k-means:**\n\n")
+    for (i in seq_len(nrow(km_labels))) {
+      cat(sprintf("- **C%d:** %s\n", km_labels$cluster[i], km_labels$km_label[i]))
+    }
+    cat("\n**Legenda tematów LDA:**\n\n")
+    for (i in seq_len(nrow(lda_labels))) {
+      cat(sprintf("- **T%d:** %s\n", lda_labels$topic[i], lda_labels$lda_label[i]))
+    }
+  }
+})
+```
+
+### Sentyment medialny vs notowania WIG20
+
+Porównanie sentymentu medialnego z faktyczną ceną indeksu **WIG20** (tygodniowe close). Jeśli sentyment medialny ma jakąś moc prognozującą lub współbieżną z rynkiem, powinniśmy widzieć korelację - wahania sentymentu nakładające się na ruchy ceny.
+
+```{r sentiment-vs-wig20, fig.width=11, fig.height=8}
+safe_chunk({
+  library(lubridate)
+  wig <- safe_read_csv(constants$wig20_weekly_path, "wig20_w")
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(wig) || is.null(st)) {
+    cat("Brak danych do overlay WIG20 vs sentyment.\n")
+  } else {
+    wig <- wig %>%
+      mutate(date = as.Date(Data),
+             period = floor_date(date, "week")) %>%
+      select(period, wig_close = Zamkniecie, wig_vol = Wolumen)
+
+    sent <- st %>%
+      mutate(period = as.Date(period)) %>%
+      select(period, mean_score, n_articles)
+
+    # Match on the week period - only weeks where both data exist.
+    merged <- inner_join(sent, wig, by = "period") %>%
+      arrange(period) %>%
+      mutate(
+        wig_return = (wig_close / lag(wig_close) - 1) * 100,
+        sent_lag1 = lag(mean_score)
+      )
+
+    cat(sprintf("Weeks with both data: %d   Date range: %s - %s\n\n",
+                nrow(merged),
+                min(merged$period), max(merged$period)))
+
+    # Range and correlation tests.
+    cor_concurrent <- cor(merged$mean_score, merged$wig_return,
+                          use = "complete.obs", method = "spearman")
+    cor_lagged <- cor(merged$sent_lag1, merged$wig_return,
+                      use = "complete.obs", method = "spearman")
+
+    p1 <- ggplot(merged, aes(x = period)) +
+      geom_line(aes(y = mean_score), color = "steelblue", linewidth = 0.6, alpha = 0.7) +
+      geom_smooth(aes(y = mean_score), method = "loess", se = FALSE,
+                  color = "darkblue", linewidth = 0.9) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      labs(title = "Sentyment medialny (mean score per tydzien)",
+           x = NULL, y = "Sentyment") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    p2 <- ggplot(merged, aes(x = period, y = wig_close)) +
+      geom_line(color = "darkred", linewidth = 0.7) +
+      scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+      labs(title = "WIG20 (close, tygodniowo)",
+           x = "Rok", y = "Close") +
+      theme_minimal(base_size = 11)
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(p1, p2, ncol = 1, align = "v",
+                               rel_heights = c(0.5, 0.5)))
+    } else {
+      print(p1); print(p2)
+    }
+
+    cat(sprintf("\n**Korelacja Spearmana (sentyment vs WIG20 weekly return):**\n\n"))
+    cat(sprintf("- Współbieżna (ten sam tydzień): **rho = %.3f**\n", cor_concurrent))
+    cat(sprintf("- Lag 1 tydzień (sentyment z poprzedniego tygodnia vs WIG20 return): **rho = %.3f**\n",
+                cor_lagged))
+  }
+})
+```
+
+```{r sentiment-wig20-scatter, fig.width=10, fig.height=4.5}
+safe_chunk({
+  library(lubridate)
+  wig <- safe_read_csv(constants$wig20_weekly_path, "wig20_w")
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(wig) || is.null(st)) {
+    cat("Brak danych.\n")
+  } else {
+    wig <- wig %>%
+      mutate(date = as.Date(Data),
+             period = floor_date(date, "week")) %>%
+      arrange(date) %>%
+      mutate(wig_return = (Zamkniecie / lag(Zamkniecie) - 1) * 100) %>%
+      select(period, wig_return)
+
+    sent <- st %>% mutate(period = as.Date(period)) %>%
+      select(period, mean_score, n_articles)
+
+    merged <- inner_join(sent, wig, by = "period") %>%
+      filter(!is.na(wig_return), n_articles >= 5)
+
+    p <- ggplot(merged, aes(x = mean_score, y = wig_return)) +
+      geom_point(alpha = 0.5, color = "steelblue", aes(size = n_articles)) +
+      geom_smooth(method = "lm", se = TRUE, color = "darkred",
+                  fill = "darkred", alpha = 0.15) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+      scale_size_continuous(range = c(0.5, 4), guide = "none") +
+      labs(title = "Korelacja: sentyment medialny vs WIG20 weekly return (ten sam tydzien)",
+           subtitle = "Punkt = jeden tydzien; rozmiar = liczba artykulow w danym tygodniu",
+           x = "Sentyment (mean score per week)",
+           y = "WIG20 return (%, week-over-week)") +
+      theme_minimal(base_size = 11)
+    print(p)
+  }
+})
+```
+
+# Klastrowanie (k-means)
+
+```{r kmeans-k}
+safe_chunk({
+  cat(sprintf("Liczba klastrów k = **%d** (parametr `sentiment_kmeans_k` w constants.R).\n",
+              constants$sentiment_kmeans_k))
+})
+```
+
+W odróżnieniu od LDA (soft clustering - każdy artykuł ma rozkład prawdopodobieństw na tematach), **k-means** przypisuje każdy artykuł do **jednego** klastra. Algorytm operuje na macierzy TF-IDF (DTM ważone TF-IDF + L2 normalizacja → cosine ≈ euclidean) i grupuje artykuły o podobnym profilu słów.
+
+## Rozmiary klastrów
+
+```{r kmeans-sizes-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "kmeans_sizes.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury kmeans_sizes.png.\n")
+})
+```
+
+## Top słowa per klaster
+
+```{r kmeans-words-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "kmeans_words.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury kmeans_words.png.\n")
+})
+```
+
+```{r kmeans-words-table}
+safe_chunk({
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  if (is.null(km_words)) {
+    cat("Brak danych kmeans_words_per_cluster.csv.\n")
+  } else {
+    top8 <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 8, with_ties = FALSE) %>%
+      summarise(top_words = paste(word, collapse = ", "), .groups = "drop")
+    knitr::kable(top8, caption = "Top 8 słów per klaster (k-means)")
+  }
+})
+```
+
 # Topic modeling (LDA)
 
 ```{r topics-lda-k}
@@ -305,7 +720,7 @@ safe_chunk({
 })
 ```
 
-Model LDA przypisuje każdemu artykułowi rozkład prawdopodobieństwa nad k tematami, a każdy temat to rozkład nad słowami. Poniżej top słowa per temat (beta — prawdopodobieństwo słowa w temacie) oraz heatmap przynależności artykułów do tematów (gamma).
+Model LDA przypisuje każdemu artykułowi rozkład prawdopodobieństwa nad k tematami, a każdy temat to rozkład nad słowami. Poniżej top słowa per temat (beta - prawdopodobieństwo słowa w temacie) oraz heatmap przynależności artykułów do tematów (gamma).
 
 ## Top słowa per temat
 
@@ -323,9 +738,9 @@ safe_chunk({
         group_by(topic) %>%
         slice_max(beta, n = 10) %>%
         ungroup() %>%
-        mutate(word = reorder(word, beta))
+        mutate(term = reorder(term, beta))
 
-      ggplot(top_per_topic, aes(x = word, y = beta, fill = factor(topic))) +
+      ggplot(top_per_topic, aes(x = term, y = beta, fill = factor(topic))) +
         geom_col(show.legend = FALSE) +
         facet_wrap(~ topic, scales = "free_y") +
         coord_flip() +
@@ -349,7 +764,7 @@ safe_chunk({
     top5 <- topics %>%
       group_by(topic) %>%
       slice_max(beta, n = 5) %>%
-      summarise(top_words = paste(word, collapse = ", "), .groups = "drop")
+      summarise(top_words = paste(term, collapse = ", "), .groups = "drop")
     knitr::kable(top5, caption = "Top 5 słów per temat")
   }
 })
@@ -385,7 +800,36 @@ safe_chunk({
 
 # Profile semantyczne spółek (TF-IDF)
 
-TF-IDF wskazuje, które słowa są charakterystyczne dla danej spółki w odniesieniu do całego korpusu — wysoki TF-IDF = słowo często występuje przy konkretnym tickerze, a rzadko gdzie indziej. To pozwala zobaczyć "o czym pisze się przy danej spółce".
+TF-IDF wskazuje, które słowa są charakterystyczne dla danej spółki w odniesieniu do całego korpusu - wysoki TF-IDF = słowo często występuje przy konkretnym tickerze, a rzadko gdzie indziej. To pozwala zobaczyć "o czym pisze się przy danej spółce".
+
+## Globalny TF-IDF (cały korpus)
+
+Globalny widok TF-IDF - każdy artykuł traktowany jako oddzielny dokument, suma TF-IDF po wszystkich artykułach. To pokazuje słowa o największej wadze **poza** klasykami (które mają wysoki TF ale bardzo niskie IDF → niskie TF-IDF, więc spadają z rankingu).
+
+```{r tfidf-global-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "tfidf_global.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury tfidf_global.png.\n")
+})
+```
+
+```{r tfidf-global-table}
+safe_chunk({
+  glob <- safe_read_csv(constants$tfidf_global, "tfidf_global")
+  if (is.null(glob)) {
+    cat("Brak danych tfidf_global.csv.\n")
+  } else {
+    top20 <- glob %>%
+      arrange(desc(sum_tfidf)) %>%
+      head(20) %>%
+      transmute(word, doc_freq, sum_tfidf = round(sum_tfidf, 2), mean_tfidf = round(mean_tfidf, 4))
+    knitr::kable(top20, caption = "Top 20 słów globalnego TF-IDF (poza klasykami)")
+  }
+})
+```
+
+## TF-IDF per spółka
 
 ```{r tfidf-figure, out.width="95%"}
 safe_chunk({
@@ -425,7 +869,7 @@ safe_chunk({
         coord_flip() +
         scale_x_reordered() +
         labs(
-          title = "Top 10 słów charakterystycznych (TF-IDF) — top 10 najpopularniejszych spółek",
+          title = "Top 10 słów charakterystycznych (TF-IDF) - top 10 najpopularniejszych spółek",
           x = NULL,
           y = "TF-IDF"
         ) +
@@ -457,7 +901,7 @@ safe_chunk({
     main_topics <- topics %>%
       group_by(topic) %>%
       slice_max(beta, n = 3) %>%
-      summarise(label = paste(word, collapse = " / "), .groups = "drop")
+      summarise(label = paste(term, collapse = " / "), .groups = "drop")
     cat("**Główne tematy w korpusie:**\n\n")
     for (i in seq_len(nrow(main_topics))) {
       cat(sprintf("- Temat %d: %s\n", main_topics$topic[i], main_topics$label[i]))
@@ -468,11 +912,11 @@ safe_chunk({
 
 **Ograniczenia analizy:**
 
-- Rozmiar korpusu ograniczony do artykułów scrapowanych z bankier.pl w wybranym oknie czasowym — przy małej liczbie artykułów per ticker (próg `sentiment_ticker_min_relevance = 5`) ranking może być zaszumiony.
-- Słownik **PL custom** w obecnej wersji to ~30 słów — pełna wersja docelowa rozszerzona o plWordNet emo (~31k) i Loughran-McDonald PL (~4150 słów).
-- Lemmatyzacja modelem `polish-pdb-ud-2.5` — możliwe niedopasowania dla terminologii finansowej (slang giełdowy, skróty).
-- Sentyment leksykonowy nie uchwytuje ironii, kontekstu szerszego niż okno negacji (3 tokeny — `sentiment_negation_window`) i sarkazmu.
-- LDA z k=5 tematów — przy większym korpusie warto eksperymentować z większą wartością k i metryką coherence.
+- Rozmiar korpusu ograniczony do artykułów scrapowanych z bankier.pl w wybranym oknie czasowym - przy małej liczbie artykułów per ticker (próg `sentiment_ticker_min_relevance = 5`) ranking może być zaszumiony.
+- Stack słowników liczy **21 252 wpisów** (plWordNet 18 884 + LM_PL 2 206 + Custom 162), z priorytetem Custom → LM_PL → plWN. Top-50 najczęstszych słów LM_PL po DeepL zostało zweryfikowane ręcznie (dropping mistranslated prefixed terms typu `klasyfikacja` ← `misclassification`).
+- Lemmatyzacja modelem `polish-pdb-ud-2.5` - możliwe niedopasowania dla terminologii finansowej (slang giełdowy, skróty).
+- Sentyment leksykonowy nie uchwytuje ironii, kontekstu szerszego niż okno negacji (3 tokeny - `sentiment_negation_window`) i sarkazmu.
+- LDA z k=5 tematów - przy większym korpusie warto eksperymentować z większą wartością k i metryką coherence.
 
 **Pliki źródłowe wyników:** `dataset/processed/`
 

@@ -15,7 +15,11 @@ plwn_filtered_txt <- file.path(constants$workspace_raw, "plwn_filtered.txt")
 plwn_drops_csv <- file.path(constants$workspace_review, "plwn_parse_drops.csv")
 plwn_out_csv <- constants$sentiment_lexicon_general
 
-pos_int_to_upos <- c("1" = "NOUN", "2" = "VERB", "3" = "ADJ", "4" = "ADV")
+# Verified against raw plWN 4.5 data 2026-05-29:
+#   1=VERB (kupować, biegać), 2=NOUN (kotek, zysk, aborcja), 3=ADV (szybko), 4=ADJ (biały)
+# Previous mapping (1=NOUN, 2=VERB, 3=ADJ, 4=ADV) was wrong — caused all
+# (lemma, pos) joins in sentiment.R to fail because udpipe POS would never match.
+pos_int_to_upos <- c("1" = "VERB", "2" = "NOUN", "3" = "ADV", "4" = "ADJ")
 
 markedness_to_sentiment <- function(m) {
   m_trim <- str_trim(m)
@@ -40,7 +44,9 @@ markedness_strength <- function(m) {
 extract_filtered_dump <- function(zip_path, inner_sql, out_path) {
   if (!file.exists(zip_path)) {
     stop(sprintf(
-      "plWordNet ZIP not found at: %s\n  Download from: https://clarin-pl.eu/dspace/handle/11321/535 (or https://clarin-pl.eu/wordnet/)\n  Place the file `wordnet_work_4_5.zip` into: %s",
+      paste0("plWordNet ZIP not found at: %s\n",
+             "  Download from: https://clarin-pl.eu/dspace/handle/11321/535\n",
+             "  Place the file `wordnet_work_4_5.zip` into: %s"),
       zip_path, constants$workspace_raw
     ))
   }
@@ -72,103 +78,95 @@ extract_filtered_dump <- function(zip_path, inner_sql, out_path) {
 lex_rx <- "^\\((\\d+),'((?:[^'\\\\]|\\\\.)*)',(\\d+),(\\d+),"
 emo_rx <- "^\\((\\d+),(\\d+),'((?:[^'\\\\]|\\\\.)*)','((?:[^'\\\\]|\\\\.)*)','((?:[^'\\\\]|\\\\.)*)',"
 
-# Track which table the current INSERT block belongs to. Closure-based state.
-make_chunk_callback <- function() {
-  state <- new.env(parent = emptyenv())
-  state$current_table <- NA_character_
-  state$lex_rows <- list()
-  state$emo_rows <- list()
-  state$drops <- list()
-  state$n_lex_lines <- 0L
-  state$n_emo_lines <- 0L
-  state$n_lex_drop <- 0L
-  state$n_emo_drop <- 0L
+# Parse the filtered dump using a state machine with PRE-ALLOCATED vectors
+# (original chunked + list-append was O(N^2) on N=709k lines — killed after 49 min
+# stuck in memory copying). Single-pass linear scan, ~minutes for full plWN.
+parse_filtered_dump <- function(file_path) {
+  lines <- readr::read_lines(file_path, progress = FALSE)
+  n <- length(lines)
+  message(sprintf("Loaded %d lines (%.1f MB in RAM)", n, n * 100 / 1024 / 1024))
 
-  cb <- function(lines, pos) {
-    for (ln in lines) {
-      if (startsWith(ln, "INSERT INTO `lexicalunit`")) {
-        state$current_table <- "lexicalunit"
-        # The first tuple is on the same line right after VALUES. awk splits inter-tuple
-        # `),(` but the very first `(` follows ` VALUES `. Re-anchor by stripping prefix.
-        m <- regexpr("VALUES \\(", ln)
-        if (m > 0) {
-          rest <- substring(ln, m + nchar("VALUES "))
-          parse_lex(rest, state)
-        }
-        next
-      }
-      if (startsWith(ln, "INSERT INTO `emotion`")) {
-        state$current_table <- "emotion"
-        m <- regexpr("VALUES \\(", ln)
-        if (m > 0) {
-          rest <- substring(ln, m + nchar("VALUES "))
-          parse_emo(rest, state)
-        }
-        next
-      }
-      if (!startsWith(ln, "(")) next
+  # Pre-allocate. Real counts will be lower; we trim at end.
+  lex_id <- integer(n)
+  lex_lemma <- character(n)
+  lex_domain <- integer(n)
+  lex_pos <- integer(n)
+  lex_count <- 0L
+  lex_drop <- 0L
 
-      if (identical(state$current_table, "lexicalunit")) {
-        parse_lex(ln, state)
-      } else if (identical(state$current_table, "emotion")) {
-        parse_emo(ln, state)
-      }
+  emo_id <- integer(n)
+  emo_lex_id <- integer(n)
+  emo_emotions <- character(n)
+  emo_valuations <- character(n)
+  emo_markedness <- character(n)
+  emo_count <- 0L
+  emo_drop <- 0L
+
+  current_table <- 0L  # 0 = none, 1 = lex, 2 = emo
+
+  for (i in seq_len(n)) {
+    ln <- lines[i]
+
+    # Switch table on INSERT header. First tuple is appended after VALUES on same line.
+    if (startsWith(ln, "INSERT INTO `lexicalunit`")) {
+      current_table <- 1L
+      m <- regexpr("VALUES \\(", ln, fixed = FALSE)
+      if (m > 0) ln <- substring(ln, m + nchar("VALUES ")) else next
+    } else if (startsWith(ln, "INSERT INTO `emotion`")) {
+      current_table <- 2L
+      m <- regexpr("VALUES \\(", ln, fixed = FALSE)
+      if (m > 0) ln <- substring(ln, m + nchar("VALUES ")) else next
+    } else if (!startsWith(ln, "(")) {
+      next
     }
-    TRUE
+
+    if (current_table == 1L) {
+      parts <- regmatches(ln, regexec(lex_rx, ln, perl = TRUE))[[1]]
+      if (length(parts) < 5L) {
+        lex_drop <- lex_drop + 1L
+        next
+      }
+      lex_count <- lex_count + 1L
+      lex_id[lex_count] <- suppressWarnings(as.integer(parts[2]))
+      lex_lemma[lex_count] <- parts[3]
+      lex_domain[lex_count] <- suppressWarnings(as.integer(parts[4]))
+      lex_pos[lex_count] <- suppressWarnings(as.integer(parts[5]))
+    } else if (current_table == 2L) {
+      parts <- regmatches(ln, regexec(emo_rx, ln, perl = TRUE))[[1]]
+      if (length(parts) < 6L) {
+        emo_drop <- emo_drop + 1L
+        next
+      }
+      emo_count <- emo_count + 1L
+      emo_id[emo_count] <- suppressWarnings(as.integer(parts[2]))
+      emo_lex_id[emo_count] <- suppressWarnings(as.integer(parts[3]))
+      emo_emotions[emo_count] <- parts[4]
+      emo_valuations[emo_count] <- parts[5]
+      emo_markedness[emo_count] <- parts[6]
+    }
+
+    if (i %% 100000L == 0L) {
+      message(sprintf("  %d/%d lines, lex=%d emo=%d", i, n, lex_count, emo_count))
+    }
   }
 
-  list(callback = cb, state = state)
-}
-
-parse_lex <- function(line, state) {
-  state$n_lex_lines <- state$n_lex_lines + 1L
-  m <- tryCatch(
-    regmatches(line, regexec(lex_rx, line, perl = TRUE)),
-    error = function(e) list(character(0))
+  list(
+    lex_df = tibble(
+      ID = lex_id[seq_len(lex_count)],
+      lemma = lex_lemma[seq_len(lex_count)],
+      domain = lex_domain[seq_len(lex_count)],
+      pos_int = lex_pos[seq_len(lex_count)]
+    ),
+    emo_df = tibble(
+      id = emo_id[seq_len(emo_count)],
+      lexicalunit_id = emo_lex_id[seq_len(emo_count)],
+      emotions = emo_emotions[seq_len(emo_count)],
+      valuations = emo_valuations[seq_len(emo_count)],
+      markedness = emo_markedness[seq_len(emo_count)]
+    ),
+    n_lex_drop = lex_drop,
+    n_emo_drop = emo_drop
   )
-  if (length(m[[1]]) == 0L) {
-    state$n_lex_drop <- state$n_lex_drop + 1L
-    state$drops[[length(state$drops) + 1L]] <- data.frame(
-      table = "lexicalunit", reason = "regex_no_match",
-      snippet = substr(line, 1, 200), stringsAsFactors = FALSE
-    )
-    return(invisible())
-  }
-  parts <- m[[1]]
-  # parts: [full, id, lemma, domain, pos]
-  state$lex_rows[[length(state$lex_rows) + 1L]] <- list(
-    ID = suppressWarnings(as.integer(parts[2])),
-    lemma = parts[3],
-    domain = suppressWarnings(as.integer(parts[4])),
-    pos_int = suppressWarnings(as.integer(parts[5]))
-  )
-  invisible()
-}
-
-parse_emo <- function(line, state) {
-  state$n_emo_lines <- state$n_emo_lines + 1L
-  m <- tryCatch(
-    regmatches(line, regexec(emo_rx, line, perl = TRUE)),
-    error = function(e) list(character(0))
-  )
-  if (length(m[[1]]) == 0L) {
-    state$n_emo_drop <- state$n_emo_drop + 1L
-    state$drops[[length(state$drops) + 1L]] <- data.frame(
-      table = "emotion", reason = "regex_no_match",
-      snippet = substr(line, 1, 200), stringsAsFactors = FALSE
-    )
-    return(invisible())
-  }
-  parts <- m[[1]]
-  # parts: [full, id, lexicalunit_id, emotions, valuations, markedness]
-  state$emo_rows[[length(state$emo_rows) + 1L]] <- list(
-    id = suppressWarnings(as.integer(parts[2])),
-    lexicalunit_id = suppressWarnings(as.integer(parts[3])),
-    emotions = parts[4],
-    valuations = parts[5],
-    markedness = parts[6]
-  )
-  invisible()
 }
 
 build_plwordnet_csv <- function() {
@@ -182,38 +180,23 @@ build_plwordnet_csv <- function() {
     dir.create(constants$dictionaries_directory, recursive = TRUE)
   }
 
-  extract_filtered_dump(plwn_zip_path, plwn_inner_sql, plwn_filtered_txt)
-
-  message("Parsing filtered dump in chunks...")
-  cb_pack <- make_chunk_callback()
-  read_lines_chunked(
-    plwn_filtered_txt,
-    callback = SideEffectChunkCallback$new(cb_pack$callback),
-    chunk_size = 50000L,
-    progress = FALSE
-  )
-
-  st <- cb_pack$state
-
-  lex_df <- if (length(st$lex_rows) > 0) {
-    bind_rows(lapply(st$lex_rows, as_tibble))
+  # Skip re-extract if filtered.txt already exists (idempotent re-runs).
+  if (!file.exists(plwn_filtered_txt) || file.info(plwn_filtered_txt)$size < 10 * 1024 * 1024) {
+    extract_filtered_dump(plwn_zip_path, plwn_inner_sql, plwn_filtered_txt)
   } else {
-    tibble(ID = integer(), lemma = character(), domain = integer(), pos_int = integer())
+    message(sprintf("Reusing existing filtered dump: %s (%.0f MB)",
+                    plwn_filtered_txt, file.info(plwn_filtered_txt)$size / 1024 / 1024))
   }
 
-  emo_df <- if (length(st$emo_rows) > 0) {
-    bind_rows(lapply(st$emo_rows, as_tibble))
-  } else {
-    tibble(
-      id = integer(), lexicalunit_id = integer(),
-      emotions = character(), valuations = character(), markedness = character()
-    )
-  }
+  message("Parsing filtered dump (single-pass, pre-allocated vectors)...")
+  parsed <- parse_filtered_dump(plwn_filtered_txt)
+  lex_df <- parsed$lex_df
+  emo_df <- parsed$emo_df
 
-  drops_df <- if (length(st$drops) > 0) bind_rows(st$drops) else tibble(table = character(), reason = character(), snippet = character())
+  drops_df <- tibble(table = character(), reason = character(), snippet = character())
 
-  message(sprintf("Parsed lex rows: %d (drops: %d)", nrow(lex_df), st$n_lex_drop))
-  message(sprintf("Parsed emo rows: %d (drops: %d)", nrow(emo_df), st$n_emo_drop))
+  message(sprintf("Parsed lex rows: %d (drops: %d)", nrow(lex_df), parsed$n_lex_drop))
+  message(sprintf("Parsed emo rows: %d (drops: %d)", nrow(emo_df), parsed$n_emo_drop))
 
   joined <- lex_df |>
     inner_join(emo_df, by = c("ID" = "lexicalunit_id"))
@@ -255,8 +238,8 @@ build_plwordnet_csv <- function() {
   }
 
   message("--- Summary ---")
-  message(sprintf("lex parsed: %d (drops %d)", nrow(lex_df), st$n_lex_drop))
-  message(sprintf("emo parsed: %d (drops %d)", nrow(emo_df), st$n_emo_drop))
+  message(sprintf("lex parsed: %d (drops %d)", nrow(lex_df), parsed$n_lex_drop))
+  message(sprintf("emo parsed: %d (drops %d)", nrow(emo_df), parsed$n_emo_drop))
   message(sprintf("joined:     %d", nrow(joined)))
   message(sprintf("after filt: %d", nrow(enriched)))
   message(sprintf("final:      %d", nrow(deduped)))

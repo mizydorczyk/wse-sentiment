@@ -17,28 +17,33 @@ source("src/common/constants.R")
 source("src/common/text_pipeline.R")
 
 apply_negation_flip <- function(tokens_with_sentiment, all_tokens, window = constants$sentiment_negation_window) {
+  # Vectorized rewrite — previous rowwise() implementation did O(matched × all_tokens)
+  # filtering per token, billion ops on 9666-article corpus.
+  # New approach: pre-compute negator positions per sentence, then for each matched
+  # token check if any negator falls in [token_id - window, token_id - 1].
   negators <- tolower(constants$sentiment_negators_pl)
 
-  context <- all_tokens |>
-    select("article_id", "sentence_id", "token_id", "lemma") |>
-    rename(neg_lemma = "lemma", neg_token_id = "token_id")
+  neg_positions <- all_tokens |>
+    filter(.data$lemma %in% negators) |>
+    select("article_id", "sentence_id", "token_id") |>
+    rename(neg_token_id = "token_id")
+
+  # For each matched token, look up matching sentence's negator positions and check window.
+  joined <- tokens_with_sentiment |>
+    left_join(neg_positions, by = c("article_id", "sentence_id"),
+              relationship = "many-to-many")
+
+  has_neg <- joined |>
+    mutate(in_window = !is.na(.data$neg_token_id) &
+             .data$neg_token_id < .data$token_id &
+             .data$neg_token_id >= .data$token_id - window) |>
+    group_by(.data$article_id, .data$sentence_id, .data$token_id) |>
+    summarise(has_negator = any(.data$in_window), .groups = "drop")
 
   flipped <- tokens_with_sentiment |>
-    rowwise() |>
+    left_join(has_neg, by = c("article_id", "sentence_id", "token_id")) |>
     mutate(
-      has_negator = {
-        prev_tokens <- context |>
-          filter(
-            .data$article_id == .env$article_id,
-            .data$sentence_id == .env$sentence_id,
-            .data$neg_token_id < .env$token_id,
-            .data$neg_token_id >= .env$token_id - window
-          )
-        any(prev_tokens$neg_lemma %in% negators)
-      }
-    ) |>
-    ungroup() |>
-    mutate(
+      has_negator = tidyr::replace_na(.data$has_negator, FALSE),
       sentiment = if_else(
         .data$has_negator & .data$sentiment %in% c("positive", "negative"),
         if_else(.data$sentiment == "positive", "negative", "positive"),
@@ -67,8 +72,11 @@ compute_sentiment <- function(tokens, lexicon) {
   matched_pos <- tokens |>
     inner_join(lexicon |> filter(.data$pos != "ANY"), by = c("lemma", "pos"))
 
+  any_lex <- lexicon |>
+    filter(.data$pos == "ANY") |>
+    select(-"pos")
   matched_any <- tokens |>
-    inner_join(lexicon |> filter(.data$pos == "ANY") |> select(-"pos"), by = "lemma") |>
+    inner_join(any_lex, by = "lemma") |>
     anti_join(matched_pos, by = c("article_id", "sentence_id", "token_id"))
 
   matched <- bind_rows(matched_pos, matched_any) |>
@@ -152,7 +160,8 @@ summarize_per_article <- function(sentiment_df, all_article_ids) {
   result
 }
 
-summarize_per_ticker <- function(per_article, articles_with_tickers, min_relevance = constants$sentiment_ticker_min_relevance) {
+summarize_per_ticker <- function(per_article, articles_with_tickers,
+                                 min_relevance = constants$sentiment_ticker_min_relevance) {
   joined <- articles_with_tickers |>
     filter(!is.na(.data$ticker), .data$relevance_score >= min_relevance) |>
     select("article_id", "ticker", "relevance_score") |>
@@ -184,7 +193,8 @@ summarize_per_ticker <- function(per_article, articles_with_tickers, min_relevan
     arrange(desc(.data$mean_score))
 }
 
-summarize_timeline <- function(per_article, articles_with_tickers, granularity = constants$sentiment_timeline_granularity) {
+summarize_timeline <- function(per_article, articles_with_tickers,
+                               granularity = constants$sentiment_timeline_granularity) {
   date_floor <- switch(granularity,
     "day" = function(x) lubridate::floor_date(x, "day"),
     "week" = function(x) lubridate::floor_date(x, "week"),
@@ -345,7 +355,7 @@ run_sentiment_pipeline <- function() {
 
   message("Loading udpipe model + lemmatizing...")
   model <- load_udpipe_model()
-  tokens <- lemmatize_tokens(articles, model)
+  tokens <- lemmatize_tokens(articles, model, cache_path = constants$lemmatized_tokens_cache)
   message(sprintf("  %d tokens lemmatized", nrow(tokens)))
 
   message("Loading sentiment lexicon...")
