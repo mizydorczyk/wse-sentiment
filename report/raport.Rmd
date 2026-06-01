@@ -1,0 +1,1374 @@
+---
+title: "Analiza sentymentu i tematów artykułów finansowych GPW"
+subtitle: "Projekt zaliczeniowy PSI 2026"
+author: "Liszniańska, Izydorczyk, Zabłocki"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    theme: readable
+    highlight: kate
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+    df_print: paged
+knit: (function(input, ...) rmarkdown::render(input, knit_root_dir = rprojroot::find_root(rprojroot::has_file("renv.lock")), output_dir = dirname(input)))
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(knitr)
+  library(DT)
+  library(scales)
+  library(jsonlite)
+})
+
+source("src/common/constants.R")
+
+safe_read_csv <- function(path, label) {
+  if (!file.exists(path)) {
+    message(sprintf("[Brak danych] %s: %s", label, path))
+    return(NULL)
+  }
+  read.csv(path, stringsAsFactors = FALSE, encoding = "UTF-8")
+}
+
+safe_read_json <- function(path, label) {
+  if (!file.exists(path)) {
+    message(sprintf("[Brak danych] %s: %s", label, path))
+    return(NULL)
+  }
+  jsonlite::fromJSON(path, simplifyDataFrame = TRUE)
+}
+
+safe_chunk <- function(expr, fallback_msg = "Dane jeszcze niedostępne - uruchom pipeline aby wygenerować.") {
+  tryCatch(expr, error = function(e) {
+    cat(fallback_msg, "\n")
+    cat("Błąd:", conditionMessage(e), "\n")
+  })
+}
+
+fmt_int <- function(x) scales::comma(x, accuracy = 1, big.mark = " ")
+fmt_pct <- function(x) scales::percent(x, accuracy = 0.1)
+```
+
+# Wprowadzenie
+
+Celem projektu jest zbudowanie pipeline'u automatycznej analizy tekstów finansowych z serwisu bankier.pl, który dla każdej spółki notowanej na Giełdzie Papierów Wartościowych w Warszawie (GPW) wyciąga sygnał sentymentu medialnego oraz identyfikuje główne tematy poruszane w artykułach. Praca powstała w ramach przedmiotu *Projektowanie Systemów Informatycznych* (PSI) na semestr 2026.
+
+Źródłem danych są artykuły scrapowane z bankier.pl - zarówno bieżące przez RSS, jak i historyczne przez archiwum portalu. Tickery spółek GPW przypisywane są automatycznie do każdego artykułu na podstawie wykrywania wystąpień nazw firm i symboli giełdowych w tekście (skrypt `src/data_ingestion/assign_tickers.R`).
+
+Zastosowano pięć technik analizy tekstu: (1) leksykonową analizę sentymentu opartą na zhybrydyzowanym słowniku polskim (LM-PL + plWordNet + słownik własny), (2) klastrowanie k-means (hard clustering) na bazie macierzy TF-IDF, (3) modelowanie tematyczne LDA (Latent Dirichlet Allocation, soft clustering), (4) profile semantyczne spółek metodą TF-IDF oraz (5) analizę częstości słów wraz z chmurą słów. Raport prezentuje wyniki - kod analizy znajduje się w `src/sentiment.R` oraz `src/clustering.R`.
+
+# Dane i preprocessing
+
+Pipeline danych obejmuje następujące etapy: pobranie listy artykułów (RSS + archive) → scraping treści → parsowanie HTML do czystego tekstu → przypisanie tickerów GPW → lematyzacja tekstu modelem udpipe (`polish-pdb-ud-2.5`).
+
+Słowniki sentymentu stanowią hybrydę trzech źródeł:
+
+- plWordNet emo - ogólnotematyczny słownik emocji dla języka polskiego, po parsowaniu z dumpu SQL i mappingu POS do UD: 18 884 wpisów (NOUN/VERB/ADJ/ADV, sentiment positive/negative),
+- Loughran-McDonald PL - finansowy słownik LM przetłumaczony przez DeepL API + lematyzacja udpipe + filtr open-class POS + manual review top-50 (dropping mistranslated prefixed terms): 2 206 wpisów (kategorie: positive, negative, uncertainty, litigious, constraining),
+- Custom PL - własny minisłownik specyficzny dla domeny GPW (hossa/bessa/rajd, dywidenda/inwestycja, frankowicze/KNF/WIBOR itd.): 162 wpisy, najwyższy priorytet (override LM_PL i plWN).
+
+Stopwords to lista `stopwords-iso` dla języka polskiego (~342 słowa) rozszerzona o 38 słów domenowych: 22 neutralne biznesowe (np. *artykuł*, *informacja*, *komunikat*) oraz 16 artefaktów scrapingu (rozszerzenia plików: `xhtml`, `xades`, `pdf`, `xls`, `html` itd.). Dodatkowo filtr w pipeline odrzuca tokeny zawierające bajty mojibake z niepoprawnie odkodowanych załączników ESPI.
+
+```{r dane-summary}
+safe_chunk({
+  library(lubridate)
+  # Read as nested list (NOT simplifyDataFrame) - manifest has list-column `tickers`.
+  manifest <- if (file.exists(constants$processed_manifest_file)) {
+    jsonlite::fromJSON(constants$processed_manifest_file, simplifyVector = FALSE)
+  } else NULL
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  tokens <- if (file.exists(constants$lemmatized_tokens_cache)) {
+    readRDS(constants$lemmatized_tokens_cache)
+  } else NULL
+
+  n_articles <- if (!is.null(manifest)) length(manifest) else NA_integer_
+
+  date_range <- if (!is.null(dates)) {
+    d <- suppressWarnings(ymd_hm(dates$publication_date, quiet = TRUE))
+    d <- as.Date(d)
+    d <- d[!is.na(d)]
+    if (length(d) > 0) sprintf("%s - %s", min(d), max(d)) else "n/d"
+  } else "n/d"
+
+  # Unique tickers attributed to at least one article (from processed manifest)
+  n_tickers <- if (!is.null(manifest)) {
+    ts <- unlist(lapply(manifest, function(x) {
+      if (length(x$tickers) == 0) character(0)
+      else vapply(x$tickers, function(t) t$ticker, character(1))
+    }))
+    length(unique(ts))
+  } else NA_integer_
+
+  # Articles with at least one ticker
+  n_with_ticker <- if (!is.null(manifest)) {
+    sum(vapply(manifest, function(x) length(x$tickers) > 0, logical(1)))
+  } else NA_integer_
+
+  # Mean article length in tokens (lemmatized - proxy for length).
+  mean_tokens <- if (!is.null(tokens)) {
+    counts <- tokens |> dplyr::count(.data$article_id, name = "n_tokens")
+    round(mean(counts$n_tokens))
+  } else NA_integer_
+
+  total_tokens <- if (!is.null(tokens)) nrow(tokens) else NA_integer_
+
+  summary_tbl <- data.frame(
+    Metryka = c("Liczba artykułów",
+                "Zakres dat (publikacja)",
+                "Artykuły z przypisanym tickerem",
+                "Liczba unikalnych tickerów (z manifestu)",
+                "Łączna liczba tokenów (po lematyzacji)",
+                "Średnia liczba tokenów / artykuł"),
+    Wartość = c(fmt_int(n_articles),
+                date_range,
+                ifelse(is.na(n_with_ticker), "n/d",
+                       sprintf("%s (%.0f%%)", fmt_int(n_with_ticker),
+                               100 * n_with_ticker / max(n_articles, 1))),
+                ifelse(is.na(n_tickers), "n/d", fmt_int(n_tickers)),
+                ifelse(is.na(total_tokens), "n/d", fmt_int(total_tokens)),
+                ifelse(is.na(mean_tokens), "n/d", fmt_int(mean_tokens)))
+  )
+  knitr::kable(summary_tbl, caption = "Podsumowanie korpusu artykułów")
+})
+```
+
+# Analiza częstości słów
+
+## Top 30 najczęstszych słów
+
+```{r word-freq-top30}
+safe_chunk({
+  wf <- safe_read_csv(constants$word_freq, "word_freq")
+  if (is.null(wf)) {
+    cat("Brak danych word_freq.csv - uruchom pipeline tokenizacji.\n")
+  } else {
+    top30 <- wf %>%
+      arrange(desc(freq)) %>%
+      head(30) %>%
+      mutate(word = factor(word, levels = rev(word)))
+
+    ggplot(top30, aes(x = word, y = freq)) +
+      geom_col(fill = "steelblue") +
+      coord_flip() +
+      scale_y_continuous(labels = scales::comma) +
+      labs(
+        title = "Top 30 najczęstszych słów w korpusie",
+        x = NULL,
+        y = "Liczba wystąpień"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+## Wordcloud globalny
+
+```{r wordcloud-global, out.width="80%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "wordcloud_global.png")
+  if (!file.exists(path)) {
+    cat("Brak pliku", path, "- wygeneruj wordcloud w pipeline.\n")
+  } else {
+    knitr::include_graphics(path)
+  }
+})
+```
+
+# Analiza sentymentu
+
+## Chmury słów: pozytywne vs negatywne
+
+Słowa które najczęściej dostały etykietę `positive` (zielone) vs `negative` (czerwone) w korpusie. Wizualizacja kontrastu finansowego sentymentu.
+
+```{r wordcloud-sentiment, out.width="95%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "wordcloud_sentiment.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury wordcloud_sentiment.png.\n")
+})
+```
+
+## Chmury słów per kategoria LM
+
+Loughran-McDonald-style kategorie: `positive`, `negative`, `uncertainty` (niepewność), `litigious` (prawne), `constraining` (regulacyjne). Pokazuje semantyczny krajobraz każdej kategorii w korpusie bankier.pl.
+
+```{r wordcloud-per-category, fig.width=12, fig.height=8}
+safe_chunk({
+  suppressPackageStartupMessages({
+    library(wordcloud); library(RColorBrewer)
+  })
+  source("src/common/text_pipeline.R")
+  tokens <- if (file.exists(constants$lemmatized_tokens_cache)) {
+    readRDS(constants$lemmatized_tokens_cache)
+  } else NULL
+  lex <- tryCatch(load_sentiment_lexicon(), error = function(e) NULL)
+  if (is.null(tokens) || is.null(lex)) {
+    cat("Brak danych - uruchom pipeline.\n")
+  } else {
+    matched <- tokens |>
+      inner_join(lex |> filter(.data$pos != "ANY"), by = c("lemma", "pos"))
+    cats <- c("positive", "negative", "uncertainty", "litigious", "constraining")
+    palettes <- c(positive = "Greens", negative = "Reds",
+                  uncertainty = "BuPu", litigious = "Oranges", constraining = "Purples")
+
+    par(mfrow = c(2, 3), mar = c(1, 1, 2, 1))
+    for (cat_name in cats) {
+      sub <- matched |>
+        filter(.data$category == cat_name) |>
+        count(.data$lemma, sort = TRUE, name = "freq") |>
+        head(60)
+      if (nrow(sub) == 0) {
+        plot.new(); title(paste(cat_name, "(brak)"))
+        next
+      }
+      tryCatch({
+        wordcloud(sub$lemma, sub$freq, min.freq = 1, max.words = 60,
+                  scale = c(2.8, 0.4), random.order = FALSE, rot.per = 0.2,
+                  colors = brewer.pal(8, palettes[[cat_name]])[4:8])
+        title(cat_name, line = 0.5)
+      }, error = function(e) {
+        plot.new(); title(paste(cat_name, "(err)"))
+      })
+    }
+    plot.new()  # 6th cell empty
+  }
+})
+```
+
+## Ranking spółek (per ticker)
+
+Wartość `mean_score` to średnia z znormalizowanych wyników sentymentu artykułów przypisanych do danej spółki. Tickery z `n_articles_with_signal = 0` (brak słów sentymentowych w artykułach) zostały odfiltrowane z wykresu rankingu i pokazane osobno.
+
+```{r sentiment-per-ticker-bar, fig.height=12, fig.width=9}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  if (is.null(spt)) {
+    cat("Brak danych sentiment_per_ticker.csv.\n")
+  } else {
+    spt_signal <- spt %>%
+      filter(n_articles_with_signal > 0) %>%
+      arrange(desc(mean_score)) %>%
+      mutate(
+        ticker = factor(ticker, levels = ticker),
+        sign = ifelse(mean_score >= 0, "pozytywny", "negatywny")
+      )
+
+    ggplot(spt_signal, aes(x = ticker, y = mean_score, fill = sign)) +
+      geom_col() +
+      scale_fill_manual(values = c("pozytywny" = "#2ca02c", "negatywny" = "#d62728")) +
+      coord_flip() +
+      labs(
+        title = "Średni sentyment medialny per spółka GPW",
+        x = NULL,
+        y = "Średni score sentymentu",
+        fill = "Wydźwięk"
+      ) +
+      theme_minimal(base_size = 11)
+  }
+})
+```
+
+```{r sentiment-per-ticker-top, results="asis"}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  if (is.null(spt)) {
+    cat("Brak danych.\n")
+  } else {
+    spt_signal <- spt %>% filter(n_articles_with_signal > 0)
+    top5_pos <- spt_signal %>% arrange(desc(mean_score)) %>% head(5)
+    top5_neg <- spt_signal %>% arrange(mean_score) %>% head(5)
+
+    cat("\nTop 5 spółek o najpozytywniejszym sentymencie:\n\n")
+    print(knitr::kable(top5_pos, digits = 3))
+    cat("\nTop 5 spółek o najnegatywniejszym sentymencie:\n\n")
+    print(knitr::kable(top5_neg, digits = 3))
+
+    no_signal <- spt %>% filter(n_articles_with_signal == 0)
+    if (nrow(no_signal) > 0) {
+      cat(sprintf("\nSpółki bez sygnału sentymentu (%d): %s\n",
+                  nrow(no_signal),
+                  paste(no_signal$ticker, collapse = ", ")))
+    }
+  }
+})
+```
+
+## Pokrycie spółek: liczba artykułów i rozkład w czasie
+
+Które spółki są najczęściej omawiane w korpusie i jak ich pokrycie medialne rozkłada się w czasie. Liczba artykułów per spółka wpływa na wiarygodność rankingu sentymentu - spółki z kilkoma artykułami mają zaszumiony `mean_score`.
+
+```{r ticker-coverage, fig.width=10, fig.height=5}
+safe_chunk({
+  manifest <- if (file.exists(constants$processed_manifest_file)) {
+    jsonlite::fromJSON(constants$processed_manifest_file, simplifyVector = FALSE)
+  } else NULL
+  if (is.null(manifest)) {
+    cat("Brak manifestu.\n")
+  } else {
+    rows <- do.call(rbind, lapply(manifest, function(x) {
+      if (length(x$tickers) == 0) return(NULL)
+      do.call(rbind, lapply(x$tickers, function(t) {
+        data.frame(article_id = x$id, ticker = t$ticker, stringsAsFactors = FALSE)
+      }))
+    }))
+    counts <- rows %>% count(ticker, sort = TRUE) %>% head(15) %>%
+      mutate(ticker = factor(ticker, levels = rev(ticker)))
+
+    ggplot(counts, aes(x = ticker, y = n)) +
+      geom_col(fill = "steelblue") +
+      geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+      coord_flip() +
+      labs(title = "Top 15 spółek wg liczby artykułów",
+           x = NULL, y = "Liczba artykułów") +
+      theme_minimal(base_size = 11) +
+      expand_limits(y = max(counts$n) * 1.08)
+  }
+})
+```
+
+```{r ticker-coverage-time, fig.width=10, fig.height=5}
+safe_chunk({
+  library(lubridate)
+  manifest <- if (file.exists(constants$processed_manifest_file)) {
+    jsonlite::fromJSON(constants$processed_manifest_file, simplifyVector = FALSE)
+  } else NULL
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  if (is.null(manifest) || is.null(dates)) {
+    cat("Brak danych.\n")
+  } else {
+    rows <- do.call(rbind, lapply(manifest, function(x) {
+      if (length(x$tickers) == 0) return(NULL)
+      do.call(rbind, lapply(x$tickers, function(t) {
+        data.frame(article_id = x$id, ticker = t$ticker, stringsAsFactors = FALSE)
+      }))
+    }))
+    top5 <- rows %>% count(ticker, sort = TRUE) %>% head(5) %>% pull(ticker)
+
+    coverage <- rows %>%
+      filter(ticker %in% top5) %>%
+      inner_join(dates, by = "article_id") %>%
+      mutate(d = suppressWarnings(ymd_hm(publication_date, quiet = TRUE)),
+             period = floor_date(as.Date(d), "month")) %>%
+      filter(!is.na(period)) %>%
+      count(ticker, period, name = "n") %>%
+      mutate(ticker = factor(ticker, levels = top5))
+
+    ggplot(coverage, aes(x = period, y = n, color = ticker)) +
+      geom_line(linewidth = 0.8) +
+      geom_point(size = 1.2, alpha = 0.6) +
+      scale_color_brewer(palette = "Set1") +
+      scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+      labs(title = "Pokrycie medialne top 5 spółek w czasie (miesięcznie)",
+           subtitle = "PKN Orlen, PKO BP, KGHM, Pekao, Santander",
+           x = "Miesiąc", y = "Liczba artykułów", color = "Ticker") +
+      theme_minimal(base_size = 11)
+  }
+})
+```
+
+## Sentyment per artykuł
+
+Rozkład wyników sentymentu na poziomie pojedynczego artykułu - pozwala zobaczyć ogólny kształt korpusu (czy dominują nastroje pozytywne, neutralne czy negatywne).
+
+```{r sentiment-per-article-hist}
+safe_chunk({
+  spa <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  if (is.null(spa)) {
+    cat("Brak danych sentiment_per_article.csv.\n")
+  } else {
+    ggplot(spa, aes(x = score)) +
+      geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+      labs(
+        title = "Rozkład sentymentu per artykuł",
+        x = "Score sentymentu",
+        y = "Liczba artykułów"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+```{r sentiment-per-article-table}
+safe_chunk({
+  spa <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  if (is.null(spa)) {
+    cat("Brak danych.\n")
+  } else {
+    extremes <- bind_rows(
+      spa %>% arrange(desc(score)) %>% head(10) %>% mutate(kategoria = "Top 10 pozytywnych"),
+      spa %>% arrange(score) %>% head(10) %>% mutate(kategoria = "Top 10 negatywnych")
+    )
+    DT::datatable(
+      extremes,
+      filter = "top",
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    )
+  }
+})
+```
+
+## Sentyment GPW w czasie
+
+Linia trendu sentymentu medialnego w czasie - granularność tygodniowa (parametr `sentiment_timeline_granularity` w `constants.R`). Linia wygładzona (`geom_smooth`) pokazuje średnioterminowy trend.
+
+```{r sentiment-timeline}
+safe_chunk({
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(st)) {
+    cat("Brak danych sentiment_timeline.csv.\n")
+  } else {
+    st <- st %>% mutate(period = suppressWarnings(as.Date(period)))
+
+    ggplot(st, aes(x = period, y = mean_score)) +
+      geom_line(color = "steelblue", linewidth = 0.8) +
+      geom_point(aes(size = n_articles), color = "steelblue", alpha = 0.6) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred", alpha = 0.2) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      scale_size_continuous(range = c(1, 5)) +
+      labs(
+        title = "Sentyment medialny GPW w czasie",
+        x = "Okres",
+        y = "Średni sentyment",
+        size = "Liczba artykułów"
+      ) +
+      theme_minimal()
+  }
+})
+```
+
+### Sentyment vs główne tematy w czasie
+
+Sentyment w czasie z nałożeniem udziału klastrów tematycznych (k-means) - dolny panel pokazuje proporcję artykułów przypisanych do danego klastra w każdym miesiącu, górny powtarza sentyment z miesięczną granularnością. Pozwala zobaczyć czy zmiany sentymentu nakładają się na zmiany struktury tematycznej (np. wzrost klastra "ropa/paliwa" w okresie kryzysu może korelować z neg sentymentem).
+
+```{r sentiment-vs-topics, fig.width=11, fig.height=11}
+safe_chunk({
+  library(lubridate)
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  sent <- safe_read_csv(constants$sentiment_per_article, "sentiment_per_article")
+  km <- safe_read_csv(constants$kmeans_assignments, "kmeans_assignments")
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(dates) || is.null(sent) || is.null(km)) {
+    cat("Brak danych do zestawienia sentyment vs tematy.\n")
+  } else {
+    cluster_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(label = sprintf("C%d: %s", first(cluster),
+                                paste(word, collapse = ", ")), .groups = "drop")
+
+    merged <- sent %>%
+      inner_join(dates, by = "article_id") %>%
+      inner_join(km, by = "article_id") %>%
+      mutate(
+        date = suppressWarnings(ymd_hm(publication_date, quiet = TRUE)),
+        date = as.Date(date),
+        period = floor_date(date, "week")
+      ) %>%
+      filter(!is.na(period))
+
+    sent_w <- merged %>%
+      group_by(period) %>%
+      summarise(mean_score = mean(score, na.rm = TRUE),
+                n = dplyr::n(), .groups = "drop")
+
+    cluster_share <- merged %>%
+      count(period, cluster, name = "n_in_cluster") %>%
+      group_by(period) %>%
+      mutate(share = n_in_cluster / sum(n_in_cluster)) %>%
+      ungroup() %>%
+      left_join(cluster_labels, by = "cluster") %>%
+      mutate(label = factor(label, levels = rev(cluster_labels$label)))
+
+    date_range <- range(merged$period, na.rm = TRUE)
+
+    p1 <- ggplot(sent_w, aes(x = period, y = mean_score)) +
+      geom_line(color = "steelblue", linewidth = 0.5, alpha = 0.7) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred",
+                  fill = "darkred", alpha = 0.15, linewidth = 0.9) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y") +
+      labs(title = "Sentyment GPW (średni wynik na tydzień)",
+           x = NULL, y = "Mean score") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    p2 <- ggplot(cluster_share, aes(x = period, y = label, fill = share)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "rocket", direction = -1,
+                           labels = scales::percent_format(accuracy = 1)) +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y",
+                   expand = c(0, 0)) +
+      labs(title = "Udzial klastrow k-means w czasie (heatmap, tygodniowo)",
+           x = NULL, y = NULL, fill = "Udzial") +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            legend.position = "right")
+
+    # LDA topic shares - mean gamma per topic per period
+    lda_share <- merged %>%
+      select(article_id, period) %>%
+      inner_join(gamma, by = "article_id") %>%
+      group_by(period, topic) %>%
+      summarise(mean_gamma = mean(gamma), .groups = "drop")
+
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(label = sprintf("T%d: %s", first(topic),
+                                paste(term, collapse = ", ")), .groups = "drop")
+
+    lda_share <- lda_share %>%
+      left_join(lda_labels, by = "topic") %>%
+      mutate(label = factor(label, levels = rev(lda_labels$label)))
+
+    p3 <- ggplot(lda_share, aes(x = period, y = label, fill = mean_gamma)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "mako", direction = -1,
+                           labels = scales::percent_format(accuracy = 1)) +
+      scale_x_date(limits = date_range, date_breaks = "1 year", date_labels = "%Y",
+                   expand = c(0, 0)) +
+      labs(title = "Udzial tematow LDA w czasie (heatmap, tygodniowo)",
+           x = "Rok", y = NULL, fill = "Mean gamma") +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid = element_blank(),
+            legend.position = "right")
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      cowplot::plot_grid(p1, p2, p3, ncol = 1, align = "v",
+                         rel_heights = c(0.3, 0.35, 0.35))
+    } else {
+      print(p1); print(p2); print(p3)
+    }
+  }
+})
+```
+
+### Dominujący temat per miesiąc (k-means + LDA)
+
+Dla każdego miesiąca dominujący klaster k-means (z top słowami) oraz dominujący LDA topic (z top słowami). Pozwala szybko prześledzić "o czym pisał się rynek" miesiąc po miesiącu.
+
+```{r dominant-topics-per-month, fig.width=14, fig.height=7}
+safe_chunk({
+  library(lubridate)
+  dates <- safe_read_csv(constants$article_dates, "article_dates")
+  km <- safe_read_csv(constants$kmeans_assignments, "kmeans_assignments")
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(dates) || is.null(km) || is.null(km_words) || is.null(gamma) || is.null(topics)) {
+    cat("Brak danych.\n")
+  } else {
+    km_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(km_label = paste(word, collapse = ", "), .groups = "drop")
+
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lda_label = paste(term, collapse = ", "), .groups = "drop")
+
+    article_period <- dates %>%
+      mutate(date = suppressWarnings(ymd_hm(publication_date, quiet = TRUE)),
+             date = as.Date(date),
+             period = floor_date(date, "month")) %>%
+      filter(!is.na(period)) %>%
+      select(article_id, period)
+
+    # No agressive filter - drop only months with <3 articles (single-article noise).
+    n_per_month <- article_period %>% count(period, name = "n_articles")
+    good_periods <- n_per_month %>% filter(n_articles >= 3) %>% pull(period)
+
+    dom_km <- article_period %>%
+      filter(period %in% good_periods) %>%
+      inner_join(km, by = "article_id") %>%
+      count(period, cluster) %>%
+      group_by(period) %>%
+      slice_max(n, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      left_join(km_labels, by = "cluster") %>%
+      mutate(row = "Dominujacy k-means klaster",
+             label = sprintf("C%d", cluster))
+
+    dom_lda <- article_period %>%
+      filter(period %in% good_periods) %>%
+      inner_join(gamma, by = "article_id") %>%
+      group_by(period, topic) %>%
+      summarise(mean_gamma = mean(gamma), .groups = "drop") %>%
+      group_by(period) %>%
+      slice_max(mean_gamma, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      left_join(lda_labels, by = "topic") %>%
+      mutate(row = "Dominujacy LDA temat",
+             label = sprintf("T%d", topic))
+
+    combined <- bind_rows(
+      dom_km %>% transmute(period, row, label, value = factor(cluster)),
+      dom_lda %>% transmute(period, row, label, value = factor(topic))
+    )
+
+    # Split into two halves by date so each tile gets ~2x more horizontal space.
+    median_date <- as.Date(median(as.numeric(combined$period), na.rm = TRUE),
+                           origin = "1970-01-01")
+    p_top <- combined %>% filter(period <= median_date)
+    p_bot <- combined %>% filter(period > median_date)
+
+    make_panel <- function(df, title_suffix) {
+      ggplot(df, aes(x = period, y = row, fill = value)) +
+        geom_tile(color = "white", linewidth = 0.3) +
+        geom_text(aes(label = label), size = 3.2, fontface = "bold") +
+        scale_fill_brewer(palette = "Set3", guide = "none") +
+        scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m",
+                     expand = c(0.01, 0.01)) +
+        labs(title = title_suffix, x = NULL, y = NULL) +
+        theme_minimal(base_size = 10) +
+        theme(panel.grid = element_blank(),
+              axis.text.y = element_text(face = "bold"),
+              axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+    }
+
+    pA <- make_panel(p_top, sprintf("Dominujacy temat: %s - %s",
+                                    format(min(p_top$period), "%Y-%m"),
+                                    format(max(p_top$period), "%Y-%m")))
+    pB <- make_panel(p_bot, sprintf("Dominujacy temat: %s - %s",
+                                    format(min(p_bot$period), "%Y-%m"),
+                                    format(max(p_bot$period), "%Y-%m")))
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(pA, pB, ncol = 1, align = "v"))
+    } else {
+      print(pA); print(pB)
+    }
+  }
+})
+```
+
+```{r dominant-topics-legend, results="asis"}
+safe_chunk({
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (!is.null(km_words) && !is.null(topics)) {
+    km_labels <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(km_label = paste(word, collapse = ", "), .groups = "drop")
+    lda_labels <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lda_label = paste(term, collapse = ", "), .groups = "drop")
+
+    cat("Legenda klastrów k-means:\n\n")
+    for (i in seq_len(nrow(km_labels))) {
+      cat(sprintf("- C%d: %s\n", km_labels$cluster[i], km_labels$km_label[i]))
+    }
+    cat("\nLegenda tematów LDA:\n\n")
+    for (i in seq_len(nrow(lda_labels))) {
+      cat(sprintf("- T%d: %s\n", lda_labels$topic[i], lda_labels$lda_label[i]))
+    }
+  }
+})
+```
+
+### Sentyment medialny vs notowania WIG20
+
+Porównanie sentymentu medialnego z faktyczną ceną indeksu WIG20 (tygodniowe close). Jeśli sentyment medialny ma jakąś moc prognozującą lub współbieżną z rynkiem, powinniśmy widzieć korelację - wahania sentymentu nakładające się na ruchy ceny.
+
+```{r sentiment-vs-wig20, fig.width=11, fig.height=8}
+safe_chunk({
+  library(lubridate)
+  wig <- safe_read_csv(constants$wig20_weekly_path, "wig20_w")
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(wig) || is.null(st)) {
+    cat("Brak danych do zestawienia WIG20 vs sentyment.\n")
+  } else {
+    wig <- wig %>%
+      mutate(date = as.Date(Data),
+             period = floor_date(date, "week")) %>%
+      select(period, wig_close = Zamkniecie, wig_vol = Wolumen)
+
+    sent <- st %>%
+      mutate(period = as.Date(period)) %>%
+      select(period, mean_score, n_articles)
+
+    # Match on the week period - only weeks where both data exist.
+    merged <- inner_join(sent, wig, by = "period") %>%
+      arrange(period) %>%
+      mutate(
+        wig_return = (wig_close / lag(wig_close) - 1) * 100,
+        sent_lag1 = lag(mean_score)
+      )
+
+    p1 <- ggplot(merged, aes(x = period)) +
+      geom_line(aes(y = mean_score), color = "steelblue", linewidth = 0.6, alpha = 0.7) +
+      geom_smooth(aes(y = mean_score), method = "loess", se = FALSE,
+                  color = "darkblue", linewidth = 0.9) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      labs(title = "Sentyment medialny (średni wynik na tydzień)",
+           x = NULL, y = "Sentyment") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    p2 <- ggplot(merged, aes(x = period, y = wig_close)) +
+      geom_line(color = "darkred", linewidth = 0.7) +
+      scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+      labs(title = "WIG20 (kurs zamknięcia, tygodniowo)",
+           x = "Rok", y = "Close") +
+      theme_minimal(base_size = 11)
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(p1, p2, ncol = 1, align = "v",
+                               rel_heights = c(0.5, 0.5)))
+    } else {
+      print(p1); print(p2)
+    }
+  }
+})
+```
+
+```{r wig20-correlation, results="asis"}
+safe_chunk({
+  library(lubridate)
+  wig <- safe_read_csv(constants$wig20_weekly_path, "wig20_w")
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(wig) || is.null(st)) {
+    cat("Brak danych.\n")
+  } else {
+    wig <- wig %>%
+      mutate(period = floor_date(as.Date(Data), "week")) %>%
+      select(period, wig_close = Zamkniecie)
+    sent <- st %>% mutate(period = as.Date(period)) %>% select(period, mean_score)
+    merged <- inner_join(sent, wig, by = "period") %>%
+      arrange(period) %>%
+      mutate(wig_return = (wig_close / lag(wig_close) - 1) * 100,
+             sent_lag1 = lag(mean_score))
+
+    cor_concurrent <- cor(merged$mean_score, merged$wig_return,
+                          use = "complete.obs", method = "spearman")
+    cor_lagged <- cor(merged$sent_lag1, merged$wig_return,
+                      use = "complete.obs", method = "spearman")
+
+    cat(sprintf("Tygodni z danymi z obu źródeł: %d (zakres %s - %s).\n\n",
+                nrow(merged), min(merged$period), max(merged$period)))
+    cat("Korelacja Spearmana (sentyment vs tygodniowa stopa zwrotu WIG20):\n\n")
+    cat(sprintf("- Współbieżna (ten sam tydzień): rho = %.3f\n", cor_concurrent))
+    cat(sprintf("- Z opóźnieniem 1 tygodnia (sentyment poprzedniego tygodnia vs zwrot): rho = %.3f\n",
+                cor_lagged))
+    cat("\nBrak istotnej korelacji współbieżnej oznacza, że sentyment medialny ",
+        "odzwierciedla zdarzenia już zaszłe, a nie wyprzedza ruchów rynku.\n", sep = "")
+  }
+})
+```
+
+```{r sentiment-wig20-scatter, fig.width=10, fig.height=4.5}
+safe_chunk({
+  library(lubridate)
+  wig <- safe_read_csv(constants$wig20_weekly_path, "wig20_w")
+  st <- safe_read_csv(constants$sentiment_timeline, "sentiment_timeline")
+  if (is.null(wig) || is.null(st)) {
+    cat("Brak danych.\n")
+  } else {
+    wig <- wig %>%
+      mutate(date = as.Date(Data),
+             period = floor_date(date, "week")) %>%
+      arrange(date) %>%
+      mutate(wig_return = (Zamkniecie / lag(Zamkniecie) - 1) * 100) %>%
+      select(period, wig_return)
+
+    sent <- st %>% mutate(period = as.Date(period)) %>%
+      select(period, mean_score, n_articles)
+
+    merged <- inner_join(sent, wig, by = "period") %>%
+      filter(!is.na(wig_return), n_articles >= 5)
+
+    p <- ggplot(merged, aes(x = mean_score, y = wig_return)) +
+      geom_point(alpha = 0.5, color = "steelblue", aes(size = n_articles)) +
+      geom_smooth(method = "lm", se = TRUE, color = "darkred",
+                  fill = "darkred", alpha = 0.15) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+      scale_size_continuous(range = c(0.5, 4), guide = "none") +
+      labs(title = "Korelacja: sentyment medialny vs tygodniowa stopa zwrotu WIG20 (ten sam tydzień)",
+           subtitle = "Punkt = jeden tydzień; rozmiar = liczba artykułów w danym tygodniu",
+           x = "Sentyment (średni wynik na tydzień)",
+           y = "Stopa zwrotu WIG20 (%, tydzień do tygodnia)") +
+      theme_minimal(base_size = 11)
+    print(p)
+  }
+})
+```
+
+# Case study: PKN Orlen
+
+PKN Orlen to najczęściej omawiana spółka w korpusie (340 artykułów, 215 w samym 2026 - mediana 9.5 artykułu/tydzień). Tak gęsty sygnał pozwala zrobić dla pojedynczej spółki to, co dla całego WIG20: zestawić sentyment medialny z faktyczną ceną akcji oraz pokazać, jakie tematy i kategorie napędzają wydźwięk.
+
+```{r pkn-setup, include=FALSE}
+library(lubridate)
+
+# Build per-article PKN frame for 2026 once; reused by the chunks below.
+load_pkn_2026 <- function() {
+  manifest <- jsonlite::fromJSON(constants$processed_manifest_file, simplifyVector = FALSE)
+  pkn_ids <- unlist(lapply(manifest, function(x) {
+    if (length(x$tickers) == 0) return(NULL)
+    if (any(vapply(x$tickers, function(t) t$ticker == "PKN", logical(1)))) x$id else NULL
+  }))
+  dates <- read.csv(constants$article_dates, stringsAsFactors = FALSE)
+  sent <- read.csv(constants$sentiment_per_article, stringsAsFactors = FALSE)
+
+  data.frame(article_id = pkn_ids, stringsAsFactors = FALSE) |>
+    dplyr::inner_join(dates, by = "article_id") |>
+    dplyr::mutate(date = as.Date(suppressWarnings(ymd_hm(.data$publication_date, quiet = TRUE)))) |>
+    dplyr::filter(!is.na(.data$date), .data$date >= as.Date("2026-01-01")) |>
+    dplyr::mutate(period = floor_date(.data$date, "week")) |>
+    dplyr::inner_join(sent, by = "article_id")
+}
+```
+
+## Sentyment medialny vs cena akcji PKN
+
+```{r pkn-sentiment-price, fig.width=11, fig.height=7}
+safe_chunk({
+  pkn <- load_pkn_2026()
+  price <- safe_read_csv(constants$pkn_weekly_path, "pkn_w")
+  if (nrow(pkn) == 0 || is.null(price)) {
+    cat("Brak danych PKN.\n")
+  } else {
+    sent_wk <- pkn %>%
+      group_by(period) %>%
+      summarise(mean_score = mean(score, na.rm = TRUE), n = dplyr::n(), .groups = "drop")
+
+    price <- price %>%
+      mutate(period = floor_date(as.Date(Data), "week")) %>%
+      select(period, close = Zamkniecie)
+
+    p1 <- ggplot(sent_wk, aes(x = period, y = mean_score)) +
+      geom_col(aes(fill = mean_score >= 0), show.legend = FALSE) +
+      scale_fill_manual(values = c("TRUE" = "#2ca02c", "FALSE" = "#d62728")) +
+      geom_hline(yintercept = 0, color = "gray40") +
+      scale_x_date(limits = range(price$period), date_breaks = "1 month", date_labels = "%m") +
+      labs(title = "Sentyment medialny PKN (średni wynik na tydzień, 2026)",
+           x = NULL, y = "Sentyment") +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+    p2 <- ggplot(price, aes(x = period, y = close)) +
+      geom_line(color = "darkblue", linewidth = 0.9) +
+      geom_point(color = "darkblue", size = 1.5) +
+      scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+      labs(title = "Cena akcji PKN Orlen (kurs zamknięcia, tygodniowo)",
+           x = "Miesiąc", y = "Cena [zł]") +
+      theme_minimal(base_size = 11)
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(p1, p2, ncol = 1, align = "v", rel_heights = c(0.45, 0.55)))
+    } else {
+      print(p1); print(p2)
+    }
+  }
+})
+```
+
+```{r pkn-correlation, results="asis"}
+safe_chunk({
+  pkn <- load_pkn_2026()
+  price <- safe_read_csv(constants$pkn_weekly_path, "pkn_w")
+  if (nrow(pkn) == 0 || is.null(price)) {
+    cat("Brak danych.\n")
+  } else {
+    sent_wk <- pkn %>%
+      group_by(period) %>%
+      summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop")
+    price <- price %>%
+      mutate(period = floor_date(as.Date(Data), "week")) %>%
+      arrange(period) %>%
+      mutate(ret = (Zamkniecie / lag(Zamkniecie) - 1) * 100) %>%
+      select(period, ret)
+
+    merged <- inner_join(sent_wk, price, by = "period") %>%
+      arrange(period) %>%
+      mutate(sent_lag1 = lag(mean_score))
+
+    cc <- cor(merged$mean_score, merged$ret, use = "complete.obs", method = "spearman")
+    cl <- cor(merged$sent_lag1, merged$ret, use = "complete.obs", method = "spearman")
+
+    cat(sprintf("Tygodni z danymi z obu źródeł: %d.\n\n", sum(!is.na(merged$ret))))
+    cat("Korelacja Spearmana (sentyment PKN vs tygodniowa stopa zwrotu akcji):\n\n")
+    cat(sprintf("- Współbieżna (ten sam tydzień): rho = %.3f\n", cc))
+    cat(sprintf("- Z opóźnieniem 1 tygodnia: rho = %.3f\n", cl))
+  }
+})
+```
+
+## Kategorie sentymentu PKN w czasie
+
+Z czego składa się wydźwięk wokół PKN - rozkład kategorii (pozytywny, negatywny, niepewność, prawne, regulacyjne) per tydzień.
+
+```{r pkn-categories, fig.width=11, fig.height=5}
+safe_chunk({
+  pkn <- load_pkn_2026()
+  if (nrow(pkn) == 0) {
+    cat("Brak danych.\n")
+  } else {
+    cat_long <- pkn %>%
+      group_by(period) %>%
+      summarise(across(c(n_pos, n_neg, n_uncertainty, n_litigious, n_constraining),
+                       ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
+      tidyr::pivot_longer(-period, names_to = "kategoria", values_to = "n") %>%
+      mutate(kategoria = recode(kategoria,
+        n_pos = "pozytywny", n_neg = "negatywny", n_uncertainty = "niepewność",
+        n_litigious = "prawne", n_constraining = "regulacyjne"))
+
+    ggplot(cat_long, aes(x = period, y = n, fill = kategoria)) +
+      geom_area(position = "stack", alpha = 0.85) +
+      scale_fill_brewer(palette = "Set2") +
+      scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+      labs(title = "Kategorie słów sentymentu w artykułach o PKN (2026)",
+           x = "Miesiąc", y = "Liczba dopasowań", fill = "Kategoria") +
+      theme_minimal(base_size = 11)
+  }
+})
+```
+
+## Profil tematyczny PKN
+
+Jakie tematy LDA i klastry k-means dominują w artykułach o PKN względem całego korpusu.
+
+```{r pkn-topics, fig.width=11, fig.height=4.5}
+safe_chunk({
+  pkn <- load_pkn_2026()
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  km <- safe_read_csv(constants$kmeans_assignments, "kmeans_assignments")
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  if (nrow(pkn) == 0 || is.null(gamma) || is.null(km)) {
+    cat("Brak danych.\n")
+  } else {
+    lda_lab <- topics %>% group_by(topic) %>% slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lab = paste(term, collapse = ", "), .groups = "drop") %>%
+      mutate(lab = sprintf("T%d: %s", topic, lab))
+    pkn_topic <- gamma %>% filter(article_id %in% pkn$article_id) %>%
+      group_by(topic) %>% summarise(mean_gamma = mean(gamma), .groups = "drop") %>%
+      left_join(lda_lab, by = "topic") %>%
+      mutate(lab = factor(lab, levels = lab[order(mean_gamma)]))
+
+    p1 <- ggplot(pkn_topic, aes(x = mean_gamma, y = lab)) +
+      geom_col(fill = "mediumpurple") +
+      labs(title = "Tematy LDA (mean gamma, PKN)", x = "mean gamma", y = NULL) +
+      theme_minimal(base_size = 10)
+
+    km_lab <- km_words %>% group_by(cluster) %>% slice_max(n, n = 3, with_ties = FALSE) %>%
+      summarise(lab = paste(word, collapse = ", "), .groups = "drop") %>%
+      mutate(lab = sprintf("C%d: %s", cluster, lab))
+    pkn_clu <- km %>% filter(article_id %in% pkn$article_id) %>%
+      count(cluster, name = "n") %>%
+      left_join(km_lab, by = "cluster") %>%
+      mutate(lab = factor(lab, levels = lab[order(n)]))
+
+    p2 <- ggplot(pkn_clu, aes(x = n, y = lab)) +
+      geom_col(fill = "seagreen") +
+      labs(title = "Klastry k-means (liczba artykułów, PKN)", x = "artykuły", y = NULL) +
+      theme_minimal(base_size = 10)
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(p1, p2, ncol = 2))
+    } else {
+      print(p1); print(p2)
+    }
+  }
+})
+```
+
+## Top słowa sentymentu PKN
+
+Najczęstsze słowa pozytywne (zielone) i negatywne (czerwone) w artykułach o PKN.
+
+```{r pkn-wordcloud, fig.width=11, fig.height=5}
+safe_chunk({
+  suppressPackageStartupMessages({library(wordcloud); library(RColorBrewer)})
+  pkn <- load_pkn_2026()
+  if (nrow(pkn) == 0) {
+    cat("Brak danych.\n")
+  } else {
+    split_words <- function(col) {
+      w <- unlist(strsplit(col[!is.na(col) & col != ""], ";"))
+      tb <- sort(table(w), decreasing = TRUE)
+      head(tb, 60)
+    }
+    pos <- split_words(pkn$top_pos_words)
+    neg <- split_words(pkn$top_neg_words)
+
+    par(mfrow = c(1, 2), mar = c(1, 1, 2, 1))
+    if (length(pos) > 0) {
+      wordcloud(names(pos), as.integer(pos), min.freq = 1, max.words = 60,
+                scale = c(3, 0.5), random.order = FALSE,
+                colors = brewer.pal(8, "Greens")[4:8])
+      title("PKN - pozytywne")
+    }
+    if (length(neg) > 0) {
+      wordcloud(names(neg), as.integer(neg), min.freq = 1, max.words = 60,
+                scale = c(3, 0.5), random.order = FALSE,
+                colors = brewer.pal(8, "Reds")[4:8])
+      title("PKN - negatywne")
+    }
+  }
+})
+```
+
+# Klastrowanie (k-means)
+
+Liczba klastrów k = `r constants$sentiment_kmeans_k` (parametr `sentiment_kmeans_k` w `constants.R`).
+
+W odróżnieniu od LDA (soft clustering - każdy artykuł ma rozkład prawdopodobieństw na tematach), k-means przypisuje każdy artykuł do jednego klastra. Algorytm operuje na macierzy częstości ważonej TF-IDF, a wiersze są normalizowane (L2) - dzięki temu artykuły grupowane są według proporcji słów, a nie długości tekstu (dłuższy artykuł nie trafia automatycznie do innego klastra niż krótki o tej samej tematyce).
+
+## Rozmiary klastrów
+
+```{r kmeans-sizes-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "kmeans_sizes.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury kmeans_sizes.png.\n")
+})
+```
+
+## Top słowa per klaster
+
+```{r kmeans-words-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "kmeans_words.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury kmeans_words.png.\n")
+})
+```
+
+```{r kmeans-words-table}
+safe_chunk({
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  if (is.null(km_words)) {
+    cat("Brak danych kmeans_words_per_cluster.csv.\n")
+  } else {
+    top8 <- km_words %>%
+      group_by(cluster) %>%
+      slice_max(n, n = 8, with_ties = FALSE) %>%
+      summarise(top_words = paste(word, collapse = ", "), .groups = "drop")
+    knitr::kable(top8, caption = "Top 8 słów per klaster (k-means)")
+  }
+})
+```
+
+## Chmury słów per klaster
+
+```{r kmeans-wordclouds, fig.width=11, fig.height=7}
+safe_chunk({
+  suppressPackageStartupMessages({library(wordcloud); library(RColorBrewer)})
+  km_words <- safe_read_csv(constants$kmeans_words_per_cluster, "kmeans_words_per_cluster")
+  if (is.null(km_words)) {
+    cat("Brak danych kmeans_words_per_cluster.csv.\n")
+  } else {
+    clusters <- sort(unique(km_words$cluster))
+    ncol_grid <- 3
+    nrow_grid <- ceiling(length(clusters) / ncol_grid)
+    par(mfrow = c(nrow_grid, ncol_grid), mar = c(0.5, 0.5, 2, 0.5))
+    for (cl in clusters) {
+      sub <- km_words[km_words$cluster == cl, ]
+      sub <- sub[order(-sub$n), ]
+      tryCatch({
+        wordcloud(sub$word, sub$n, min.freq = 1, max.words = 40,
+                  scale = c(2.4, 0.4), random.order = FALSE, rot.per = 0.15,
+                  colors = brewer.pal(8, "Dark2"))
+        title(sprintf("Klaster %d", cl), line = 0.5)
+      }, error = function(e) { plot.new(); title(sprintf("Klaster %d (err)", cl)) })
+    }
+  }
+})
+```
+
+# Topic modeling (LDA)
+
+Liczba tematów k = `r constants$sentiment_lda_k` (parametr `sentiment_lda_k` w `constants.R`).
+
+Model LDA przypisuje każdemu artykułowi rozkład prawdopodobieństwa nad k tematami, a każdy temat to rozkład nad słowami. Poniżej top słowa per temat (beta - prawdopodobieństwo słowa w temacie) oraz heatmap przynależności artykułów do tematów (gamma).
+
+## Top słowa per temat
+
+```{r topics-lda-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "topics_lda.png")
+  if (file.exists(path)) {
+    knitr::include_graphics(path)
+  } else {
+    topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+    if (is.null(topics)) {
+      cat("Brak danych topics_lda.csv ani figury topics_lda.png.\n")
+    } else {
+      top_per_topic <- topics %>%
+        group_by(topic) %>%
+        slice_max(beta, n = 10) %>%
+        ungroup() %>%
+        mutate(term = reorder(term, beta))
+
+      ggplot(top_per_topic, aes(x = term, y = beta, fill = factor(topic))) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~ topic, scales = "free_y") +
+        coord_flip() +
+        labs(
+          title = "Top 10 słów per temat (LDA)",
+          x = NULL,
+          y = "Beta"
+        ) +
+        theme_minimal()
+    }
+  }
+})
+```
+
+```{r topics-lda-table}
+safe_chunk({
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(topics)) {
+    cat("Brak danych.\n")
+  } else {
+    top5 <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 5) %>%
+      summarise(top_words = paste(term, collapse = ", "), .groups = "drop")
+    knitr::kable(top5, caption = "Top 5 słów per temat")
+  }
+})
+```
+
+## Chmury słów per temat LDA
+
+```{r lda-wordclouds, fig.width=11, fig.height=7}
+safe_chunk({
+  suppressPackageStartupMessages({library(wordcloud); library(RColorBrewer)})
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(topics)) {
+    cat("Brak danych topics_lda.csv.\n")
+  } else {
+    tps <- sort(unique(topics$topic))
+    ncol_grid <- 3
+    nrow_grid <- ceiling(length(tps) / ncol_grid)
+    par(mfrow = c(nrow_grid, ncol_grid), mar = c(0.5, 0.5, 2, 0.5))
+    for (tp in tps) {
+      sub <- topics[topics$topic == tp, ]
+      sub <- sub[order(-sub$beta), ]
+      tryCatch({
+        wordcloud(sub$term, sub$beta, min.freq = 0, max.words = 40,
+                  scale = c(2.4, 0.4), random.order = FALSE, rot.per = 0.15,
+                  colors = brewer.pal(8, "Set1"))
+        title(sprintf("Temat %d", tp), line = 0.5)
+      }, error = function(e) { plot.new(); title(sprintf("Temat %d (err)", tp)) })
+    }
+  }
+})
+```
+
+## Rozkład przynależności artykułów do tematów
+
+Każdy artykuł ma rozkład prawdopodobieństw (gamma) nad tematami. Przypisujemy go do tematu o najwyższej gammie ("temat dominujący"). Lewy panel pokazuje, ile artykułów dominuje każdy temat; prawy - jak pewne są te przypisania (im wyższa gamma, tym silniej artykuł należy do jednego tematu).
+
+```{r topics-gamma-dist, fig.width=11, fig.height=4.5}
+safe_chunk({
+  gamma <- safe_read_csv(constants$article_topic_gamma, "article_topic_gamma")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+  if (is.null(gamma) || is.null(topics)) {
+    cat("Brak danych.\n")
+  } else {
+    lda_lab <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3, with_ties = FALSE) %>%
+      summarise(lab = paste(term, collapse = ", "), .groups = "drop") %>%
+      mutate(lab = sprintf("T%d: %s", topic, lab))
+
+    dominant <- gamma %>%
+      group_by(article_id) %>%
+      slice_max(gamma, n = 1, with_ties = FALSE) %>%
+      ungroup()
+
+    counts <- dominant %>%
+      count(topic, name = "n") %>%
+      left_join(lda_lab, by = "topic") %>%
+      mutate(lab = factor(lab, levels = lab[order(n)]))
+
+    p1 <- ggplot(counts, aes(x = n, y = lab)) +
+      geom_col(fill = "mediumpurple") +
+      geom_text(aes(label = n), hjust = -0.15, size = 3.3) +
+      labs(title = "Liczba artykułów wg tematu dominującego",
+           x = "Liczba artykułów", y = NULL) +
+      theme_minimal(base_size = 10) +
+      expand_limits(x = max(counts$n) * 1.1)
+
+    gamma_lab <- dominant %>%
+      left_join(lda_lab, by = "topic") %>%
+      mutate(lab = factor(lab, levels = counts$lab))
+
+    p2 <- ggplot(gamma_lab, aes(x = gamma, y = lab, fill = lab)) +
+      geom_boxplot(show.legend = FALSE, outlier.size = 0.5) +
+      scale_fill_brewer(palette = "Set2") +
+      labs(title = "Rozkład gammy tematu dominującego",
+           x = "Gamma (pewność przypisania)", y = NULL) +
+      theme_minimal(base_size = 10)
+
+    if (requireNamespace("cowplot", quietly = TRUE)) {
+      print(cowplot::plot_grid(p1, p2, ncol = 2, rel_widths = c(0.5, 0.5)))
+    } else {
+      print(p1); print(p2)
+    }
+  }
+})
+```
+
+# Profile semantyczne spółek (TF-IDF)
+
+TF-IDF wskazuje, które słowa są charakterystyczne dla danej spółki w odniesieniu do całego korpusu - wysoki TF-IDF = słowo często występuje przy konkretnym tickerze, a rzadko gdzie indziej. To pozwala zobaczyć "o czym pisze się przy danej spółce".
+
+## Globalny TF-IDF (cały korpus)
+
+Globalny widok TF-IDF - każdy artykuł traktowany jako oddzielny dokument, suma TF-IDF po wszystkich artykułach. To pokazuje słowa o największej wadze poza klasykami (które mają wysoki TF ale bardzo niskie IDF → niskie TF-IDF, więc spadają z rankingu).
+
+```{r tfidf-global-figure, out.width="90%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "tfidf_global.png")
+  if (file.exists(path)) knitr::include_graphics(path)
+  else cat("Brak figury tfidf_global.png.\n")
+})
+```
+
+```{r tfidf-global-table}
+safe_chunk({
+  glob <- safe_read_csv(constants$tfidf_global, "tfidf_global")
+  if (is.null(glob)) {
+    cat("Brak danych tfidf_global.csv.\n")
+  } else {
+    top20 <- glob %>%
+      arrange(desc(sum_tfidf)) %>%
+      head(20) %>%
+      transmute(word, doc_freq, sum_tfidf = round(sum_tfidf, 2), mean_tfidf = round(mean_tfidf, 4))
+    knitr::kable(top20, caption = "Top 20 słów globalnego TF-IDF (poza klasykami)")
+  }
+})
+```
+
+## TF-IDF per spółka
+
+```{r tfidf-figure, out.width="95%"}
+safe_chunk({
+  path <- file.path(constants$figures_directory, "tfidf_per_ticker.png")
+  if (file.exists(path)) {
+    knitr::include_graphics(path)
+  } else {
+    tfidf <- safe_read_csv(constants$tfidf_per_ticker, "tfidf_per_ticker")
+    if (is.null(tfidf)) {
+      cat("Brak danych tfidf_per_ticker.csv ani figury tfidf_per_ticker.png.\n")
+    } else {
+      reorder_within <- function(x, by, within) {
+        new_x <- paste(x, within, sep = "___")
+        stats::reorder(new_x, by)
+      }
+      scale_x_reordered <- function(...) {
+        ggplot2::scale_x_discrete(labels = function(x) gsub("___.+$", "", x), ...)
+      }
+
+      top_tickers <- tfidf %>%
+        group_by(ticker) %>%
+        summarise(total_n = sum(n), .groups = "drop") %>%
+        arrange(desc(total_n)) %>%
+        head(10) %>%
+        pull(ticker)
+
+      top_words <- tfidf %>%
+        filter(ticker %in% top_tickers) %>%
+        group_by(ticker) %>%
+        slice_max(tf_idf, n = 10) %>%
+        ungroup() %>%
+        mutate(word_label = reorder_within(word, tf_idf, ticker))
+
+      ggplot(top_words, aes(x = word_label, y = tf_idf, fill = ticker)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~ ticker, scales = "free", ncol = 2) +
+        coord_flip() +
+        scale_x_reordered() +
+        labs(
+          title = "Top 10 słów charakterystycznych (TF-IDF) - top 10 najpopularniejszych spółek",
+          x = NULL,
+          y = "TF-IDF"
+        ) +
+        theme_minimal()
+    }
+  }
+})
+```
+
+# Wnioski
+
+```{r wnioski, results="asis"}
+safe_chunk({
+  spt <- safe_read_csv(constants$sentiment_per_ticker, "sentiment_per_ticker")
+  topics <- safe_read_csv(constants$topics_lda, "topics_lda")
+
+  if (!is.null(spt)) {
+    spt_signal <- spt %>% filter(n_articles_with_signal > 0)
+    top3_pos <- spt_signal %>% arrange(desc(mean_score)) %>% head(3) %>% pull(ticker)
+    top3_neg <- spt_signal %>% arrange(mean_score) %>% head(3) %>% pull(ticker)
+
+    cat("Top 3 spółki o najpozytywniejszym sentymencie medialnym:",
+        paste(top3_pos, collapse = ", "), "\n\n")
+    cat("Top 3 spółki o najnegatywniejszym sentymencie medialnym:",
+        paste(top3_neg, collapse = ", "), "\n\n")
+  }
+
+  if (!is.null(topics)) {
+    main_topics <- topics %>%
+      group_by(topic) %>%
+      slice_max(beta, n = 3) %>%
+      summarise(label = paste(term, collapse = " / "), .groups = "drop")
+    cat("Główne tematy w korpusie:\n\n")
+    for (i in seq_len(nrow(main_topics))) {
+      cat(sprintf("- Temat %d: %s\n", main_topics$topic[i], main_topics$label[i]))
+    }
+  }
+})
+```
+
+## Ograniczenia analizy
+
+- Rozmiar korpusu ograniczony do artykułów scrapowanych z bankier.pl w wybranym oknie czasowym - przy małej liczbie artykułów per ticker (próg `sentiment_ticker_min_relevance = 5`) ranking może być zaszumiony.
+- Stack słowników liczy 21 252 wpisów (plWordNet 18 884 + LM_PL 2 206 + Custom 162), z priorytetem Custom > LM_PL > plWN. Top-50 najczęstszych słów LM_PL po DeepL zostało zweryfikowane ręcznie (usunięto błędne tłumaczenia typu `klasyfikacja` z `misclassification`).
+- Ujemny średni sentyment w korpusie wynika częściowo z natury słownika finansowego: kategorie LM `uncertainty`, `litigious` i `constraining` są domyślnie traktowane jako wydźwięk negatywny, więc neutralne biznesowo terminy (umowa, regulacja, ryzyko) obniżają wynik. To cecha metodologii, nie miara faktycznego pesymizmu rynku.
+- Lemmatyzacja modelem `polish-pdb-ud-2.5` - możliwe niedopasowania dla terminologii finansowej (slang giełdowy, skróty).
+- Sentyment leksykonowy nie uchwytuje ironii, kontekstu szerszego niż okno negacji (3 tokeny - `sentiment_negation_window`) i sarkazmu.
+- LDA z k=5 tematów - przy większym korpusie warto eksperymentować z większą wartością k i metryką coherence.
+
+Pliki źródłowe wyników: `dataset/processed/`
+
+# Informacje o sesji
+
+<details>
+<summary>Kliknij aby rozwinąć `sessionInfo()`</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>

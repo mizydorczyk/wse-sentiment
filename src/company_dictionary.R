@@ -60,18 +60,9 @@ company_dictionary <- list(
   list(ticker = "ENA", stems = c("Enea", "Enei")),
   list(ticker = "EUR", stems = c("Eurocash")),
   list(ticker = "GEA", stems = c("Grenevia", "Famur")),
-  list(
-    ticker = "GPW",
-    exact_phrases = c(
-      "GPW S.A.",
-      "Grupa GPW",
-      "Grupy GPW",
-      "Grupie GPW",
-      "Giełda Papierów Wartościowych S.A.",
-      "Giełdy Papierów Wartościowych S.A.",
-      "GPW SA"
-    )
-  ),
+  # GPW S.A. (operator gieldy) usuniety - "GPW" w tekscie prawie zawsze odnosi sie
+  # do samej instytucji (Gielda Papierow Wartosciowych), nie do spolki GPW S.A.
+  # jako emitenta. Masowy false-positive, usuniety na wniosek review (PR #18).
   list(ticker = "GRX", stems = c("GreenX"), exact_phrases = c("GreenX Metals", "GreenX Metalsu")),
   list(ticker = "HWE", stems = c("Huuuge"), exact_phrases = c("Huuuge Games", "Huuuge Gamesu")),
   list(ticker = "ING", acronyms = c("ING"), exact_phrases = c("ING Bank Śląski", "Bank Śląski")),

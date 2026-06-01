@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     libxml2-dev \
     libuv1-dev \
     libx11-dev \
+    libgsl-dev \
     cmake \
     curl \
     build-essential \
