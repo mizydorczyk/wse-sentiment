@@ -97,7 +97,7 @@ extract_article_gamma <- function(lda) {
 run_kmeans <- function(dtm, k, seed = 1234) {
   if (nrow(dtm) < k) k <- max(2L, nrow(dtm) - 1L)
 
-  # TF-IDF weight DTM rows (counts → tf-idf), L2 normalize so cosine ≈ euclidean.
+  # TF-IDF weight DTM rows, L2-normalize so euclidean distance matches cosine similarity.
   dtm_tfidf <- tm::weightTfIdf(dtm)
   m <- as.matrix(dtm_tfidf)
   norms <- sqrt(rowSums(m * m))

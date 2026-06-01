@@ -4,6 +4,7 @@ constants <- list(
   archive_feeds_path = file.path("dataset", "raw", "archive.csv"),
   combined_feeds_path = file.path("dataset", "raw", "feeds.csv"),
   wig20_weekly_path = file.path("dataset", "raw", "wig20_w.csv"),
+  pkn_weekly_path = file.path("dataset", "raw", "pkn_w.csv"),
   articles_directory = file.path("dataset", "raw", "articles"),
   articles_manifest_path = file.path("dataset", "raw", "articles_manifest.json"),
   processed_manifest_file = file.path("dataset", "processed", "articles_manifest.json"),
