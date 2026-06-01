@@ -17,6 +17,9 @@ suppressPackageStartupMessages({
 source("src/common/constants.R")
 source("src/common/text_pipeline.R")
 
+# Use cairo backend so PNG output renders Polish diacritics (ą/ę/ł/ó...) in titles.
+if (capabilities("cairo")) options(bitmapType = "cairo")
+
 content_pos_filter <- c("PUNCT", "NUM", "SYM", "X")
 # Mojibake from ESPI PDF/XHTML attachments — UTF-8 bytes that got double-decoded
 # through CP1250 produce these char sequences. Drop any token containing them.
@@ -205,8 +208,8 @@ plot_topics_facet <- function(beta_df, top_n = 10, filename = "topics_lda.png") 
     tidytext::scale_y_reordered() +
     scale_fill_brewer(palette = "Set2") +
     labs(
-      title = "LDA — top slowa per topic",
-      x = "beta (prawdopodobienstwo slowa w temacie)",
+      title = "LDA - top słowa per temat",
+      x = "beta (prawdopodobieństwo słowa w temacie)",
       y = NULL
     ) +
     theme_minimal(base_size = 11)
@@ -248,7 +251,7 @@ plot_tfidf_facet <- function(tfidf_df, top_n = 10, top_tickers = 10,
     tidytext::scale_y_reordered() +
     scale_fill_brewer(palette = "Set3") +
     labs(
-      title = "TF-IDF — najbardziej charakterystyczne slowa per ticker",
+      title = "TF-IDF - najbardziej charakterystyczne słowa per ticker",
       x = "tf-idf",
       y = NULL
     ) +
@@ -342,8 +345,8 @@ plot_tfidf_global <- function(global_df, filename = "tfidf_global.png", top_n = 
 
   p <- ggplot(top, aes(x = .data$sum_tfidf, y = .data$word)) +
     geom_col(fill = "steelblue") +
-    labs(title = sprintf("Globalny TF-IDF — top %d slow", top_n),
-         subtitle = "suma tf-idf po wszystkich artykulach (article = dokument)",
+    labs(title = sprintf("Globalny TF-IDF - top %d słów", top_n),
+         subtitle = "suma tf-idf po wszystkich artykułach (artykuł = dokument)",
          x = "sum tf-idf", y = NULL) +
     theme_minimal(base_size = 11)
 
@@ -368,8 +371,8 @@ plot_kmeans_words_facet <- function(words_df, filename = "kmeans_words.png", top
     facet_wrap(~ .data$cluster, scales = "free", labeller = label_both) +
     tidytext::scale_y_reordered() +
     scale_fill_brewer(palette = "Set2") +
-    labs(title = "k-means — top slowa per klaster",
-         x = "liczba wystapien", y = NULL) +
+    labs(title = "k-means - top słowa per klaster",
+         x = "liczba wystąpień", y = NULL) +
     theme_minimal(base_size = 11)
 
   outpath <- file.path(constants$figures_directory, filename)
@@ -387,7 +390,7 @@ plot_kmeans_sizes <- function(assignments_df, filename = "kmeans_sizes.png") {
     geom_col(show.legend = FALSE) +
     geom_text(aes(label = .data$n_articles), vjust = -0.3, size = 4) +
     scale_fill_brewer(palette = "Set2") +
-    labs(title = "k-means — liczba artykulow per klaster",
+    labs(title = "k-means - liczba artykułów per klaster",
          x = "klaster", y = "n_articles") +
     theme_minimal(base_size = 12)
 

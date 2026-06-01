@@ -16,6 +16,9 @@ suppressPackageStartupMessages({
 source("src/common/constants.R")
 source("src/common/text_pipeline.R")
 
+# Use cairo backend so PNG output renders Polish diacritics (ą/ę/ł/ó...) in titles.
+if (capabilities("cairo")) options(bitmapType = "cairo")
+
 apply_negation_flip <- function(tokens_with_sentiment, all_tokens, window = constants$sentiment_negation_window) {
   # Vectorized rewrite — previous rowwise() implementation did O(matched × all_tokens)
   # filtering per token, billion ops on 9666-article corpus.
@@ -103,11 +106,22 @@ summarize_per_article <- function(sentiment_df, all_article_ids) {
     return(per_article_empty)
   }
 
+  # Score is computed from `sentiment` polarity (positive/negative), NOT `category`.
+  # This is what apply_negation_flip() mutates, so negation now affects the score.
+  # Note: LM categories uncertainty/litigious/constraining all carry sentiment=negative
+  # (see lm_category_map in build_lm_pl.R), so they contribute to n_neg here.
+  per_sent <- sentiment_df |>
+    count(.data$article_id, .data$sentiment, name = "n") |>
+    pivot_wider(names_from = "sentiment", values_from = "n", values_fill = 0)
+  for (col in c("positive", "negative")) {
+    if (!col %in% names(per_sent)) per_sent[[col]] <- 0L
+  }
+
+  # Category counts kept as separate, informative metrics (not part of score).
   per_cat <- sentiment_df |>
     count(.data$article_id, .data$category, name = "n") |>
     pivot_wider(names_from = "category", values_from = "n", values_fill = 0)
-
-  for (col in c("positive", "negative", "uncertainty", "litigious", "constraining")) {
+  for (col in c("uncertainty", "litigious", "constraining")) {
     if (!col %in% names(per_cat)) per_cat[[col]] <- 0L
   }
 
@@ -122,16 +136,18 @@ summarize_per_article <- function(sentiment_df, all_article_ids) {
   if (!"positive" %in% names(top_words)) top_words$positive <- ""
   if (!"negative" %in% names(top_words)) top_words$negative <- ""
 
-  result <- per_cat |>
+  result <- per_sent |>
     transmute(
       article_id = .data$article_id,
       score = .data$positive - .data$negative,
       n_pos = .data$positive,
-      n_neg = .data$negative,
-      n_uncertainty = .data$uncertainty,
-      n_litigious = .data$litigious,
-      n_constraining = .data$constraining
+      n_neg = .data$negative
     ) |>
+    left_join(
+      per_cat |> select(any_of(c("article_id", "uncertainty", "litigious", "constraining"))),
+      by = "article_id"
+    ) |>
+    rename(n_uncertainty = "uncertainty", n_litigious = "litigious", n_constraining = "constraining") |>
     left_join(
       top_words |> transmute(
         article_id = .data$article_id,
@@ -278,8 +294,10 @@ plot_sentiment_per_ticker <- function(per_ticker, filename = "sentiment_per_tick
          subtitle = sprintf("Próg relevance ≥ %d", constants$sentiment_ticker_min_relevance)) +
     theme_minimal(base_size = 12)
 
+  # Height scales with ticker count so all axis labels fit (was clipped at 60 tickers).
+  plot_height <- max(6, nrow(data) * 0.18)
   ggsave(file.path(constants$figures_directory, filename),
-         plot = p, width = 10, height = 6, dpi = 150, units = "in")
+         plot = p, width = 10, height = plot_height, dpi = 150, units = "in", limitsize = FALSE)
   invisible(p)
 }
 
@@ -322,6 +340,10 @@ plot_sentiment_timeline <- function(timeline_df, filename = "sentiment_timeline.
     return(invisible(NULL))
   }
 
+  gran_map <- c(week = "tydzień", day = "dzień", month = "miesiąc")
+  gran_pl <- gran_map[constants$sentiment_timeline_granularity]
+  if (is.na(gran_pl)) gran_pl <- constants$sentiment_timeline_granularity
+
   p <- ggplot(timeline_df, aes(x = .data$period, y = .data$mean_score)) +
     geom_line(color = "steelblue", linewidth = 1) +
     geom_point(color = "steelblue", size = 2) +
@@ -330,7 +352,7 @@ plot_sentiment_timeline <- function(timeline_df, filename = "sentiment_timeline.
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
     labs(x = "Okres", y = "Średni sentyment",
          title = "Indeks sentymentu GPW w czasie",
-         subtitle = sprintf("Granularność: %s", constants$sentiment_timeline_granularity)) +
+         subtitle = sprintf("Granularność: %s", gran_pl)) +
     theme_minimal(base_size = 12)
 
   ggsave(file.path(constants$figures_directory, filename),

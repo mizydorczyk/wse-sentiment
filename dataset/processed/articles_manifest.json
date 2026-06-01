@@ -14544,12 +14544,7 @@
     "id": "344ef20c977911fb74bed3677ff47fc8",
     "file": "344ef20c977911fb74bed3677ff47fc8.json",
     "url": "https://www.bankier.pl/wiadomosc/GPW-zaklada-ze-2020-21-beda-z-najwyzszym-wskaznikiem-C-I-ale-zapowiada-elastycznosc-w-wydatkach-7858933.html",
-    "tickers": [
-      {
-        "ticker": "GPW",
-        "relevance_score": 2
-      }
-    ]
+    "tickers": []
   },
   {
     "id": "346266aabe1ef2245f00839e8cfc1fff",
@@ -31112,12 +31107,7 @@
     "id": "7008cbfac60e871c01fb27f2f9da3f3a",
     "file": "7008cbfac60e871c01fb27f2f9da3f3a.json",
     "url": "https://www.bankier.pl/wiadomosc/GPW-w-I-kw-miala-29-3-mln-zl-zysku-netto-wynik-EBITDA-10-proc-powyzej-konsensusu-7884342.html",
-    "tickers": [
-      {
-        "ticker": "GPW",
-        "relevance_score": 5
-      }
-    ]
+    "tickers": []
   },
   {
     "id": "70107686bedd3fa584f138e503c3097d",
@@ -31573,12 +31563,7 @@
     "id": "714a0c3250516b7eb538fa3435a0c389",
     "file": "714a0c3250516b7eb538fa3435a0c389.json",
     "url": "https://www.bankier.pl/wiadomosc/GPW-szacuje-negatywny-wplyw-zdarzen-jednorazowych-na-wynik-netto-grupy-za-25-na-ok-10-7-mln-zl-9096095.html",
-    "tickers": [
-      {
-        "ticker": "GPW",
-        "relevance_score": 2
-      }
-    ]
+    "tickers": []
   },
   {
     "id": "715270e9d32c127afb090ba50b3d7256",
@@ -70902,12 +70887,7 @@
     "id": "fd3e5a65be2387bfb07003d099d5ac4c",
     "file": "fd3e5a65be2387bfb07003d099d5ac4c.json",
     "url": "https://www.bankier.pl/wiadomosc/GPW-moze-miec-trudnosci-z-utrzymaniem-przychodow-z-I-kwartalu-prezes-7884773.html",
-    "tickers": [
-      {
-        "ticker": "GPW",
-        "relevance_score": 3
-      }
-    ]
+    "tickers": []
   },
   {
     "id": "fd405d785a8eab0c52fdf33aecab6177",
