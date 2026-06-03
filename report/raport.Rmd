@@ -1,8 +1,7 @@
 ---
-title: "Analiza sentymentu i tematów artykułów finansowych GPW"
-subtitle: "Projekt zaliczeniowy PSI 2026"
-author: "Liszniańska, Izydorczyk, Zabłocki"
-date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+title: "Analiza sentymentu i tematów artykułów finansowych dotyczących spółek notowanych na Giełdzie Papierów Wartościowych w Warszawie"
+subtitle: "Projekt zaliczeniowy"
+author: "Natalia Liszniańska, Mateusz Izydorczyk, Franciszek Zabłocki"
 output:
   html_document:
     theme: readable
