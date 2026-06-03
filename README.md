@@ -100,3 +100,11 @@ docker run --rm \
 ```bash
 Rscript -e 'testthat::test_dir("tests/testthat", reporter="progress", chdir = TRUE)'
 ```
+
+## Contributions
+
+- [mizydorczyk](https://github.com/mizydorczyk) -- idea, articles scraping, CI/CD, assign tickers  
+- [natalialisznianska](https://github.com/natalialisznianska) -- SRS documentation  
+- [Yel1owHatGuy](https://github.com/Yel1owHatGuy) -- clustering, sentiment analysis, HTML report  
+
+Honorable mentions include OpenAI's Codex and Anthropic's Claude Code.
